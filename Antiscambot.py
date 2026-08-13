@@ -1,665 +1,812 @@
 import asyncio
 import sqlite3
-import logging
 import os
+import time
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, BaseFilter, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, 
-    InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated, FSInputFile,
-    BotCommand, BotCommandScopeDefault
+    InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 )
-from aiogram.filters import CommandStart, Command, BaseFilter, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import ParseMode
 
-# ================= НАСТРОЙКИ БОТА =================
-BOT_TOKEN = "8792564218:AAHo3taU03G4FGAtIovL6mdSNXRA72QrtE0"
-ADMIN_ID = 5341904332  # ЗАМЕНИ НА СВОЙ ID!
+# ==========================================
+# НАСТРОЙКИ БОТА
+# ==========================================
+BOT_TOKEN = "8792564218:AAHo3taU03G4FGAtIovL6mdSNXRA72QrtE0" # <-- Вставь сюда токен
+ADMIN_ID = 5341904332 # <-- Вставь сюда свой Telegram ID (числами)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
-dp.include_router(router)
 
-# ================= БАЗА ДАННЫХ (ENTERPRISE STRUCTURE) =================
-# Эта структура идеально читается в DB Browser for SQLite
+# ==========================================
+# БАЗА ДАННЫХ И МИГРАЦИИ
+# ==========================================
+DB_NAME = "antiscam_pro.db"
+
 def init_db():
-    with sqlite3.connect("antiscam_pro.db") as conn:
-        cursor = conn.cursor()
-        
-        # 1. Таблица Пользователей
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                tg_id INTEGER PRIMARY KEY,
-                tg_username TEXT,
-                roblox_username TEXT DEFAULT 'Не привязан',
-                roblox_id TEXT DEFAULT 'Не привязан',
-                trades INTEGER DEFAULT 0,
-                scams INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'user', -- user, garant, scammer, admin
-                rating_sum INTEGER DEFAULT 0,
-                reviews_count INTEGER DEFAULT 0,
-                join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # 2. Таблица Логирования Сделок (P2P) - НОВОЕ!
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS trade_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                initiator_id INTEGER,
-                partner_id INTEGER,
-                description TEXT,
-                status TEXT DEFAULT 'pending', -- pending, completed, cancelled
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Таблица пользователей
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            tg_id INTEGER PRIMARY KEY,
+            username TEXT,
+            roblox_username TEXT DEFAULT 'Не привязан',
+            roblox_id TEXT DEFAULT 'Нет',
+            status TEXT DEFAULT 'user',
+            trades INTEGER DEFAULT 0,
+            rating_sum REAL DEFAULT 0.0,
+            reviews_count INTEGER DEFAULT 0,
+            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица логов P2P сделок
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS trades_p2p (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            initiator_id INTEGER,
+            partner_id INTEGER,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица отзывов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reviewer_id INTEGER,
+            target_id INTEGER,
+            rating INTEGER,
+            review_text TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица тикетов (привязки и жалобы)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT,
+            content TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица логов аудита
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER,
+            action TEXT,
+            target_id INTEGER,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-        # 3. Таблица Отзывов
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                reviewer_id INTEGER,
-                target_id INTEGER,
-                trade_id INTEGER, -- Привязка к конкретной сделке
-                rating INTEGER,
-                review_text TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+init_db()
 
-        # 4. Таблица Тикетов (Жалобы и Привязки)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS tickets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                type TEXT, 
-                data TEXT, 
-                proof_msg_id INTEGER, 
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # 5. Таблица Аудита (Действия Админов) - НОВОЕ!
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_id INTEGER,
-                action TEXT,
-                target_id INTEGER,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-
+# Вспомогательная функция для БД
 def get_db():
-    """Возвращает подключение как словарь (Row) для удобства доступа к колонкам"""
-    conn = sqlite3.connect("antiscam_pro.db")
+    conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     return conn
 
-def log_admin_action(admin_id: int, action: str, target_id: int):
-    """Скрытно записывает действия админа в базу для безопасности"""
-    with get_db() as conn:
-        conn.execute("INSERT INTO audit_log (admin_id, action, target_id) VALUES (?, ?, ?)", 
-                     (admin_id, action, target_id))
-        conn.commit()
+# ==========================================
+# ФИЛЬТРЫ И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==========================================
+class IsAdmin(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        return message.from_user.id == ADMIN_ID
 
-# ================= FSM СОСТОЯНИЯ =================
-class RobloxLink(StatesGroup):
+class IsPrivate(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        return message.chat.type == "private"
+
+def format_rating(rating_sum, reviews_count):
+    if reviews_count == 0:
+        return "Нет оценок 🤷‍♂️"
+    avg = rating_sum / reviews_count
+    stars_count = round(avg)
+    stars = "⭐" * stars_count + "🌑" * (5 - stars_count)
+    return f"{avg:.1f} {stars} ({reviews_count} отз.)"
+
+def get_user_title(trades):
+    if trades < 5: return "🌱 Новичок"
+    elif trades < 15: return "⚔️ Опытный"
+    elif trades < 50: return "🛡 Мастер"
+    elif trades < 100: return "👑 Гранд-Мастер"
+    else: return "🔥 Легенда"
+
+def get_progress_bar(trades):
+    if trades >= 100: return "[██████████] 100%"
+    percent = trades % 10  # Для визуализации прогресса к следующему десятку
+    filled = percent
+    empty = 10 - filled
+    return f"[{'█' * filled}{'░' * empty}] {percent * 10}% до некст ранга"
+
+# ==========================================
+# КЛАВИАТУРЫ
+# ==========================================
+def get_main_reply_kb(user_id):
+    builder = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🤝 Создать сделку")],
+        [KeyboardButton(text="⭐ Оставить отзыв"), KeyboardButton(text="🧾 Создать чек")],
+        [KeyboardButton(text="🛡 Гаранты"), KeyboardButton(text="⚠️ Скамеры"), KeyboardButton(text="🏆 Топ")],
+        [KeyboardButton(text="🔍 Проверить"), KeyboardButton(text="🛎 Вызвать Гаранта")],
+        [KeyboardButton(text="🎮 Привязать Roblox"), KeyboardButton(text="🚨 Подать жалобу")]
+    ], resize_keyboard=True)
+    
+    if user_id == ADMIN_ID:
+        builder.keyboard.append([KeyboardButton(text="👑 Админ Панель")])
+        
+    return builder
+
+def get_cancel_reply_kb():
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True)
+
+def get_admin_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎫 Заявки Roblox", callback_data="admin_tickets_roblox"),
+         InlineKeyboardButton(text="🚨 Жалобы", callback_data="admin_tickets_reports")],
+        [InlineKeyboardButton(text="🔍 Поиск Юзера", callback_data="admin_search_user"),
+         InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_backup_db")]
+    ])
+
+def get_admin_user_manage_kb(target_id, current_status):
+    buttons = []
+    if current_status != 'scammer':
+        buttons.append([InlineKeyboardButton(text="☠️ В ЧС (Скам)", callback_data=f"admset_scammer_{target_id}")])
+    if current_status != 'garant':
+        buttons.append([InlineKeyboardButton(text="👑 Сделать Гарантом", callback_data=f"admset_garant_{target_id}")])
+    if current_status != 'user':
+        buttons.append([InlineKeyboardButton(text="👤 Снять статусы", callback_data=f"admset_user_{target_id}")])
+        
+    buttons.append([
+        InlineKeyboardButton(text="➕ 1 Сделка", callback_data=f"admadd_trade_{target_id}"),
+        InlineKeyboardButton(text="🧹 Обнулить", callback_data=f"admclr_stats_{target_id}")
+    ])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад в Админку", callback_data="admin_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# ==========================================
+# МАШИНА СОСТОЯНИЙ (FSM)
+# ==========================================
+class P2PTrade(StatesGroup):
+    waiting_for_partner = State()
+
+class LeaveReview(StatesGroup):
+    waiting_for_target = State()
+    waiting_for_stars = State()
+    waiting_for_text = State()
+
+class CheckUser(StatesGroup):
+    waiting_for_target = State()
+
+class CallGarant(StatesGroup):
+    waiting_for_details = State()
+
+class BindRoblox(StatesGroup):
     waiting_for_video = State()
 
 class ReportUser(StatesGroup):
     waiting_for_target = State()
     waiting_for_proofs = State()
 
-class LogTrade(StatesGroup):
-    waiting_for_partner = State()
-    waiting_for_description = State()
-
-class LeaveReview(StatesGroup):
-    waiting_for_stars = State()
-    waiting_for_text = State()
-    trade_id = None
-    target_id = None
-
 class AdminPanelStates(StatesGroup):
     waiting_for_user_search = State()
     waiting_for_roblox_data = State()
     target_ticket_id = None
 
-# ================= ФИЛЬТРЫ =================
-class IsAdmin(BaseFilter):
-    async def __call__(self, message: Message) -> bool:
-        return message.from_user.id == ADMIN_ID
-
-class IsGroup(BaseFilter):
-    async def __call__(self, message: Message) -> bool:
-        return message.chat.type in ["group", "supergroup"]
-
-class IsPrivate(BaseFilter):
-    async def __call__(self, message: Message) -> bool:
-        return message.chat.type == "private"
-
-# ================= ХЕЛПЕРЫ =================
-def get_user_title(trades: int, scams: int) -> str:
-    if scams > 0: return "🏴‍☠️ Изгой (СКАМЕР)"
-    if trades == 0: return "🌱 Новичок"
-    if trades < 5: return "⚔️ Начинающий"
-    if trades < 20: return "🛡 Опытный Трейдер"
-    if trades < 50: return "🌟 Мастер Трейда"
-    if trades < 100: return "💎 Гранд-Мастер"
-    return "👑 Легенда Роблокса"
-
-def generate_trust_bar(trades: int, scams: int) -> str:
-    if scams > 0: return "🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 [В ЧС]"
-    if trades == 0: return "⬜️⬜️⬜️⬜️⬜️⬜️⬜️⬜️⬜️⬜️ [0%]"
-    score = min(10, (trades // 3) + 1)
-    bar = "🟩" * score + "⬜️" * (10 - score)
-    percent = min(100, trades * 3 + 40)
-    return f"{bar} [{percent}%]"
-
-def format_rating(rating_sum: int, reviews_count: int) -> str:
-    if not reviews_count or reviews_count == 0: 
-        return "0.0 ⚪️⚪️⚪️⚪️⚪️ (0 отзывов)"
-    avg = rating_sum / reviews_count
-    stars_count = round(avg)
-    stars = "⭐" * stars_count + "⚪️" * (5 - stars_count)
-    return f"{avg:.1f} {stars} ({reviews_count} отзывов)"
-
-# ================= КЛАВИАТУРЫ =================
-def get_main_reply_kb(user_id: int, is_eligible_for_garant=False):
-    kb = [
-        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="🤝 Зафиксировать сделку")],
-        [KeyboardButton(text="🔗 Привязать Roblox"), KeyboardButton(text="🧾 Создать чек")],
-        [KeyboardButton(text="🚨 Подать жалобу"), KeyboardButton(text="🛎 Вызвать Гаранта")],
-        [KeyboardButton(text="🛡 Гаранты"), KeyboardButton(text="⚠️ Скамеры"), KeyboardButton(text="🏆 Топ")],
-        [KeyboardButton(text="🔍 Проверить")]
-    ]
-    if is_eligible_for_garant:
-        kb.insert(0, [KeyboardButton(text="🌟 Подать заявку на Гаранта")])
-    if user_id == ADMIN_ID:
-        kb.append([KeyboardButton(text="👑 Админ Панель")])
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, input_field_placeholder="Выберите действие...")
-
-def get_cancel_reply_kb():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True)
-
-def get_p2p_trade_kb(trade_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Подтвердить сделку", callback_data=f"trade_accept_{trade_id}"),
-            InlineKeyboardButton(text="❌ Это ошибка / Отказ", callback_data=f"trade_decline_{trade_id}")
-        ]
-    ])
-
-def get_rating_kb(trade_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="1 ⭐", callback_data=f"setrate_{trade_id}_1"),
-            InlineKeyboardButton(text="2 ⭐", callback_data=f"setrate_{trade_id}_2"),
-            InlineKeyboardButton(text="3 ⭐", callback_data=f"setrate_{trade_id}_3")
-        ],
-        [
-            InlineKeyboardButton(text="4 ⭐", callback_data=f"setrate_{trade_id}_4"),
-            InlineKeyboardButton(text="5 ⭐", callback_data=f"setrate_{trade_id}_5")
-        ]
-    ])
-
-def get_admin_main_kb():
-    with get_db() as conn:
-        rbx_t = conn.execute("SELECT COUNT(*) FROM tickets WHERE type='roblox' AND status='pending'").fetchone()[0]
-        rep_t = conn.execute("SELECT COUNT(*) FROM tickets WHERE type='report' AND status='pending'").fetchone()[0]
-        garant_t = conn.execute("SELECT COUNT(*) FROM tickets WHERE type='garant_app' AND status='pending'").fetchone()[0]
-
-    keyboard = [
-        [InlineKeyboardButton(text="🔍 Поиск юзера", callback_data="admin_search_user")],
-        [
-            InlineKeyboardButton(text=f"🎫 Роблокс ({rbx_t})", callback_data="admin_tickets_roblox"),
-            InlineKeyboardButton(text=f"🚨 Жалобы ({rep_t})", callback_data="admin_tickets_report")
-        ],
-        [InlineKeyboardButton(text=f"🌟 Заявки в Гаранты ({garant_t})", callback_data="admin_tickets_garant_app")],
-        [
-            InlineKeyboardButton(text="📊 Статистика БД", callback_data="admin_stats"),
-            InlineKeyboardButton(text="💾 Скачать БД", callback_data="admin_backup_db")
-        ]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-def get_admin_user_manage_kb(target_id: int, current_status: str):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🟢 Сделать Юзером", callback_data=f"admset_user_{target_id}"),
-            InlineKeyboardButton(text="👑 Дать Гаранта", callback_data=f"admset_garant_{target_id}")
-        ],
-        [InlineKeyboardButton(text="🚨 В ЧС (СКАМЕР)", callback_data=f"admset_scammer_{target_id}")],
-        [
-            InlineKeyboardButton(text="➕ Сделки (+1)", callback_data=f"admadd_trades_{target_id}_1"),
-            InlineKeyboardButton(text="➕ Сделки (+10)", callback_data=f"admadd_trades_{target_id}_10")
-        ],
-        [InlineKeyboardButton(text="➖ Сбросить Скам", callback_data=f"admclr_scam_{target_id}")]
-    ])
-
-# ================= ОСНОВНЫЕ ОБРАБОТЧИКИ =================
-async def setup_bot_commands():
-    commands = [
-        BotCommand(command="start", description="Перезапустить бота"),
-        BotCommand(command="profile", description="Мой профиль"),
-        BotCommand(command="check", description="Проверить пользователя")
-    ]
-    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
-
-@router.message(CommandStart(), IsPrivate())
+# ==========================================
+# ОБРАБОТЧИКИ: БАЗОВЫЕ (СТАРТ, ПРОФИЛЬ)
+# ==========================================
+@router.message(Command("start"), IsPrivate())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    with get_db() as conn:
-        user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
-        if not user:
-            conn.execute("INSERT INTO users (tg_id, tg_username) VALUES (?, ?)", 
-                         (message.from_user.id, message.from_user.username))
-        elif user['tg_username'] != message.from_user.username:
-            conn.execute("UPDATE users SET tg_username = ? WHERE tg_id = ?", 
-                         (message.from_user.username, message.from_user.id))
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
+    if not user:
+        conn.execute("INSERT INTO users (tg_id, username) VALUES (?, ?)", 
+                     (message.from_user.id, message.from_user.username))
         conn.commit()
-
-    text = (
-        "🛡 <b>AntiScam Enterprise</b>\n\n"
-        "Самая надежная база трейдеров и гарантов.\n"
-        "Проводите безопасные сделки, фиксируйте их в боте и стройте свою репутацию!\n\n"
-        "👇 <i>Используйте кнопки меню ниже:</i>"
+    conn.close()
+    
+    await message.answer(
+        f"👋 Добро пожаловать, <b>{message.from_user.first_name}</b>!\n\n"
+        f"🛡 <b>AntiScam Pro</b> — это передовая база данных трейдеров и гарантов.\n"
+        f"Используй меню ниже для навигации.",
+        reply_markup=get_main_reply_kb(message.from_user.id)
     )
-    await message.answer(text, reply_markup=get_main_reply_kb(message.from_user.id))
 
 @router.message(F.text == "❌ Отмена", IsPrivate())
-async def cancel_action(message: Message, state: FSMContext):
+async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Действие отменено.", reply_markup=get_main_reply_kb(message.from_user.id))
 
-@router.message(F.text == "👤 Мой профиль", IsPrivate())
-@router.message(Command("profile"), IsPrivate())
-async def show_profile(message: Message, state: FSMContext):
-    await state.clear()
-    with get_db() as conn:
-        user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
-
-    status_dict = {"user": "🟢 Трейдер", "garant": "👑 Оф. Гарант", "scammer": "🔴 СКАМЕР (ЧС)", "admin": "👨‍💻 Администратор"}
-    trust_bar = generate_trust_bar(user['trades'], user['scams'])
-    title = get_user_title(user['trades'], user['scams'])
-    rating_str = format_rating(user['rating_sum'], user['reviews_count'])
+@router.message(F.text == "👤 Профиль", IsPrivate())
+async def show_profile(message: Message):
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
+    conn.close()
     
-    is_eligible = (user['trades'] >= 15 and user['reviews_count'] >= 5 and 
-                   (user['rating_sum'] / user['reviews_count']) >= 4.5 and 
-                   user['scams'] == 0 and user['status'] == 'user')
+    if not user:
+        return await message.answer("Вас нет в базе. Напишите /start")
+        
+    title = get_user_title(user['trades'])
+    rating = format_rating(user['rating_sum'], user['reviews_count'])
+    progress = get_progress_bar(user['trades'])
     
-    text = (
-        f"👤 <b>Досье Трейдера</b>\n"
-        f"├ <b>ID:</b> <code>{user['tg_id']}</code>\n"
-        f"├ <b>Титул:</b> {title}\n"
-        f"└ <b>Статус:</b> {status_dict.get(user['status'], 'Неизвестно')}\n\n"
-        f"🎮 <b>Roblox Данные:</b>\n"
-        f"├ <b>Ник:</b> <code>{user['roblox_username']}</code>\n"
-        f"└ <b>ID:</b> <code>{user['roblox_id']}</code>\n\n"
-        f"📊 <b>Репутация:</b>\n"
-        f"├ Рейтинг: <b>{rating_str}</b>\n"
-        f"{trust_bar}\n"
-        f"├ ✅ Успешных сделок: <b>{user['trades']}</b>\n"
-        f"└ 🚨 Жалоб на скам: <b>{user['scams']}</b>"
-    )
-    await message.answer(text, reply_markup=get_main_reply_kb(message.from_user.id, is_eligible))
+    status_text = "🟢 Обычный пользователь"
+    if user['status'] == 'garant': status_text = "👑 Официальный Гарант"
+    elif user['status'] == 'scammer': status_text = "☠️ В ЧЁРНОМ СПИСКЕ (СКАМ)"
 
-# ================= P2P ФИКСАЦИЯ СДЕЛОК (НОВАЯ ФУНКЦИЯ) =================
-@router.message(F.text == "🤝 Зафиксировать сделку", IsPrivate())
-async def log_trade_start(message: Message, state: FSMContext):
     text = (
-        "🤝 <b>Фиксация Сделки (P2P)</b>\n\n"
-        "Чтобы получить <b>+1 к успешным сделкам</b> и возможность обменяться отзывами, "
-        "вы должны зафиксировать сделку с партнером.\n\n"
-        "👉 Введите <b>@username</b> или <b>ID</b> человека, с которым вы провели сделку:"
+        f"👤 <b>Ваш Профиль:</b>\n\n"
+        f"🔖 <b>ID:</b> <code>{user['tg_id']}</code>\n"
+        f"🎮 <b>Roblox:</b> <code>{user['roblox_username']}</code> (ID: {user['roblox_id']})\n\n"
+        f"🏆 <b>Титул:</b> {title}\n"
+        f"⚖️ <b>Статус:</b> {status_text}\n"
+        f"🤝 <b>Сделок:</b> {user['trades']}\n"
+        f"📊 <b>Прогресс:</b>\n<code>{progress}</code>\n\n"
+        f"⭐️ <b>Рейтинг:</b> {rating}"
     )
-    await message.answer(text, reply_markup=get_cancel_reply_kb())
-    await state.set_state(LogTrade.waiting_for_partner)
+    await message.answer(text)
 
-@router.message(LogTrade.waiting_for_partner, IsPrivate())
-async def log_trade_partner(message: Message, state: FSMContext):
+# ==========================================
+# ОБРАБОТЧИКИ: P2P СДЕЛКИ
+# ==========================================
+@router.message(F.text == "🤝 Создать сделку", IsPrivate())
+async def p2p_trade_start(message: Message, state: FSMContext):
+    await message.answer("🤝 Введите <b>@username</b> или <b>ID</b> человека, с которым вы успешно провели сделку (он должен подтвердить):", reply_markup=get_cancel_reply_kb())
+    await state.set_state(P2PTrade.waiting_for_partner)
+
+@router.message(P2PTrade.waiting_for_partner, IsPrivate())
+async def p2p_trade_process(message: Message, state: FSMContext):
     target = message.text.replace("@", "")
-    with get_db() as conn:
-        if target.isdigit():
-            partner = conn.execute("SELECT * FROM users WHERE tg_id = ?", (int(target),)).fetchone()
-        else:
-            partner = conn.execute("SELECT * FROM users WHERE tg_username = ? COLLATE NOCASE", (target,)).fetchone()
-
+    conn = get_db()
+    if target.isdigit():
+        partner = conn.execute("SELECT * FROM users WHERE tg_id = ?", (int(target),)).fetchone()
+    else:
+        partner = conn.execute("SELECT * FROM users WHERE username = ? COLLATE NOCASE", (target,)).fetchone()
+        
     if not partner:
-        return await message.answer("❌ Пользователь не найден в базе бота. Попросите его запустить бота: @ваш_бот", reply_markup=get_cancel_reply_kb())
+        conn.close()
+        return await message.answer("❌ Пользователь не найден в базе бота. Попросите его запустить бота.")
+        
     if partner['tg_id'] == message.from_user.id:
-        return await message.answer("❌ Вы не можете зафиксировать сделку с самим собой.")
-    if partner['status'] == 'scammer':
-        return await message.answer("⚠️ <b>ВНИМАНИЕ! Этот пользователь в ЧЕРНОМ СПИСКЕ!</b> Сделки с ним запрещены.", reply_markup=get_main_reply_kb(message.from_user.id))
+        conn.close()
+        return await message.answer("❌ Нельзя провести сделку с самим собой.")
 
-    await state.update_data(partner_id=partner['tg_id'], partner_username=partner['tg_username'])
-    await message.answer("📝 Кратко опишите, чем вы обменялись (например: <i>Я дал Frost Dragon, он дал 2000 Robux</i>):")
-    await state.set_state(LogTrade.waiting_for_description)
+    # Записываем в БД ожидающую сделку
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO trades_p2p (initiator_id, partner_id) VALUES (?, ?)", (message.from_user.id, partner['tg_id']))
+    trade_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
 
-@router.message(LogTrade.waiting_for_description, IsPrivate())
-async def log_trade_finish(message: Message, state: FSMContext):
-    data = await state.get_data()
-    partner_id = data['partner_id']
-    desc = message.text
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO trade_logs (initiator_id, partner_id, description) VALUES (?, ?, ?)",
-            (message.from_user.id, partner_id, desc)
-        )
-        trade_id = cursor.lastrowid
-        conn.commit()
-
-    await message.answer("⏳ <b>Запрос отправлен партнеру!</b>\nЕсли он подтвердит, вы оба получите +1 к сделкам.", reply_markup=get_main_reply_kb(message.from_user.id))
+    # Отправляем партнеру
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить сделку", callback_data=f"p2p_accept_{trade_id}")],
+        [InlineKeyboardButton(text="❌ Это ошибка", callback_data=f"p2p_decline_{trade_id}")]
+    ])
     
-    # Отправляем запрос партнеру
     try:
-        confirm_text = (
-            f"🤝 <b>ЗАПРОС НА ПОДТВЕРЖДЕНИЕ СДЕЛКИ</b>\n\n"
-            f"Трейдер @{message.from_user.username} утверждает, что провел с вами сделку.\n"
-            f"<b>Описание:</b> <i>{desc}</i>\n\n"
-            f"Подтверждаете ли вы это?"
-        )
-        await bot.send_message(partner_id, confirm_text, reply_markup=get_p2p_trade_kb(trade_id))
+        await bot.send_message(partner['tg_id'], f"🤝 Пользователь @{message.from_user.username} утверждает, что провел с вами успешную сделку.\nПодтверждаете?", reply_markup=kb)
+        await message.answer("✅ Запрос отправлен партнеру. Ожидайте подтверждения.", reply_markup=get_main_reply_kb(message.from_user.id))
     except:
-        pass
+        await message.answer("❌ Не удалось отправить сообщение партнеру (возможно он заблокировал бота).", reply_markup=get_main_reply_kb(message.from_user.id))
+    
     await state.clear()
 
-@router.callback_query(F.data.startswith("trade_"), IsPrivate())
-async def process_p2p_trade(call: CallbackQuery, state: FSMContext):
-    action = call.data.split("_")[1] # accept / decline
+@router.callback_query(F.data.startswith("p2p_accept_"))
+async def p2p_accept(call: CallbackQuery):
     trade_id = int(call.data.split("_")[2])
+    conn = sqlite3.connect(DB_NAME)
+    trade = conn.execute("SELECT * FROM trades_p2p WHERE id = ?", (trade_id,)).fetchone()
+    
+    if not trade or trade[3] != 'pending': # status index is 3
+        conn.close()
+        return await call.answer("❌ Эта сделка уже обработана.", show_alert=True)
+        
+    # Добавляем сделки обоим
+    conn.execute("UPDATE users SET trades = trades + 1 WHERE tg_id IN (?, ?)", (trade[1], trade[2]))
+    conn.execute("UPDATE trades_p2p SET status = 'accepted' WHERE id = ?", (trade_id,))
+    conn.commit()
+    conn.close()
+    
+    await call.message.edit_text("✅ Сделка подтверждена! Вам обоим начислена +1 сделка в статистику.")
+    try:
+        await bot.send_message(trade[1], "🎉 Партнер подтвердил сделку! Вам начислена +1 сделка.")
+    except: pass
 
-    with get_db() as conn:
-        trade = conn.execute("SELECT * FROM trade_logs WHERE id = ?", (trade_id,)).fetchone()
-        if not trade or trade['status'] != 'pending':
-            return await call.answer("Сделка уже обработана.", show_alert=True)
-            
-        if action == "accept":
-            # Меняем статус и даем +1 сделку обоим
-            conn.execute("UPDATE trade_logs SET status = 'completed' WHERE id = ?", (trade_id,))
-            conn.execute("UPDATE users SET trades = trades + 1 WHERE tg_id IN (?, ?)", (trade['initiator_id'], trade['partner_id']))
-            conn.commit()
-            
-            await call.message.edit_text("✅ <b>Сделка успешно подтверждена!</b> Вам начислен +1 трейд.")
-            
-            # Предлагаем оставить отзыв инициатору
-            try:
-                await bot.send_message(
-                    trade['initiator_id'], 
-                    f"✅ Партнер подтвердил сделку! Вы получили +1 трейд.\n\n👇 Оцените работу партнера:",
-                    reply_markup=get_rating_kb(trade_id)
-                )
-            except: pass
-            
-            # Предлагаем оставить отзыв партнеру
-            await call.message.answer(
-                "👇 Оцените, как прошла сделка с вашей стороны:", 
-                reply_markup=get_rating_kb(trade_id)
-            )
+@router.callback_query(F.data.startswith("p2p_decline_"))
+async def p2p_decline(call: CallbackQuery):
+    trade_id = int(call.data.split("_")[2])
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("UPDATE trades_p2p SET status = 'declined' WHERE id = ?", (trade_id,))
+    conn.commit()
+    conn.close()
+    await call.message.edit_text("❌ Вы отклонили сделку.")
 
-        elif action == "decline":
-            conn.execute("UPDATE trade_logs SET status = 'cancelled' WHERE id = ?", (trade_id,))
-            conn.commit()
-            await call.message.edit_text("❌ Запрос на сделку отклонен.")
-            try:
-                await bot.send_message(trade['initiator_id'], "❌ Партнер отклонил вашу заявку на фиксацию сделки.")
-            except: pass
-            
-    await call.answer()
+# ==========================================
+# ОБРАБОТЧИКИ: ОТЗЫВЫ
+# ==========================================
+@router.message(F.text == "⭐ Оставить отзыв", IsPrivate())
+async def review_start(message: Message, state: FSMContext):
+    await message.answer("Введи @username или ID Гаранта/Трейдера, которому хочешь оставить отзыв:", reply_markup=get_cancel_reply_kb())
+    await state.set_state(LeaveReview.waiting_for_target)
 
-# ================= ОТЗЫВЫ ПОСЛЕ СДЕЛКИ =================
-@router.callback_query(F.data.startswith("setrate_"), IsPrivate())
-async def review_stars_selected(call: CallbackQuery, state: FSMContext):
-    trade_id = int(call.data.split("_")[1])
-    stars = int(call.data.split("_")[2])
+@router.message(LeaveReview.waiting_for_target, IsPrivate())
+async def review_target(message: Message, state: FSMContext):
+    target = message.text.replace("@", "")
+    conn = get_db()
+    if target.isdigit():
+        user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (int(target),)).fetchone()
+    else:
+        user = conn.execute("SELECT * FROM users WHERE username = ? COLLATE NOCASE", (target,)).fetchone()
+    conn.close()
+        
+    if not user:
+        return await message.answer("❌ Пользователь не найден.")
+    if user['tg_id'] == message.from_user.id:
+        return await message.answer("❌ Нельзя оставить отзыв самому себе.")
+        
+    await state.update_data(target_id=user['tg_id'])
     
-    with get_db() as conn:
-        trade = conn.execute("SELECT initiator_id, partner_id FROM trade_logs WHERE id = ?", (trade_id,)).fetchone()
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="1 ⭐"), KeyboardButton(text="2 ⭐"), KeyboardButton(text="3 ⭐")],
+        [KeyboardButton(text="4 ⭐"), KeyboardButton(text="5 ⭐")],
+        [KeyboardButton(text="❌ Отмена")]
+    ], resize_keyboard=True)
     
-    if not trade: return await call.answer("Ошибка сделки.", show_alert=True)
-    
-    target_id = trade['partner_id'] if call.from_user.id == trade['initiator_id'] else trade['initiator_id']
-    
-    await state.update_data(trade_id=trade_id, target_id=target_id, stars=stars)
-    await call.message.edit_text(f"⭐️ <b>Вы поставили {stars} из 5.</b>")
-    await call.message.answer("📝 Напишите короткий текстовый отзыв (или отправьте '-' если не хотите):", reply_markup=get_cancel_reply_kb())
+    await message.answer(f"Какую оценку поставите пользователю @{user['username']}?", reply_markup=kb)
+    await state.set_state(LeaveReview.waiting_for_stars)
+
+@router.message(LeaveReview.waiting_for_stars, IsPrivate())
+async def review_stars(message: Message, state: FSMContext):
+    if "⭐" not in message.text:
+        return await message.answer("Пожалуйста, используйте кнопки ниже.")
+        
+    stars = int(message.text.split()[0])
+    await state.update_data(stars=stars)
+    await message.answer("Напишите короткий текстовый отзыв:", reply_markup=get_cancel_reply_kb())
     await state.set_state(LeaveReview.waiting_for_text)
 
 @router.message(LeaveReview.waiting_for_text, IsPrivate())
-async def review_save(message: Message, state: FSMContext):
+async def review_text(message: Message, state: FSMContext):
     data = await state.get_data()
+    conn = sqlite3.connect(DB_NAME)
     
-    with get_db() as conn:
-        # Проверяем, не оставлял ли он уже отзыв к этой сделке
-        exists = conn.execute("SELECT id FROM reviews WHERE reviewer_id = ? AND trade_id = ?", 
-                              (message.from_user.id, data['trade_id'])).fetchone()
-        if exists:
-            await state.clear()
-            return await message.answer("❌ Вы уже оставили отзыв к этой сделке.", reply_markup=get_main_reply_kb(message.from_user.id))
-            
-        conn.execute(
-            "INSERT INTO reviews (reviewer_id, target_id, trade_id, rating, review_text) VALUES (?, ?, ?, ?, ?)",
-            (message.from_user.id, data['target_id'], data['trade_id'], data['stars'], message.text)
-        )
-        conn.execute(
-            "UPDATE users SET rating_sum = rating_sum + ?, reviews_count = reviews_count + 1 WHERE tg_id = ?",
-            (data['stars'], data['target_id'])
-        )
-        conn.commit()
-
-    await message.answer("✅ Отзыв сохранен! Спасибо.", reply_markup=get_main_reply_kb(message.from_user.id))
+    # Сохраняем отзыв
+    conn.execute("INSERT INTO reviews (reviewer_id, target_id, rating, review_text) VALUES (?, ?, ?, ?)",
+                 (message.from_user.id, data['target_id'], data['stars'], message.text))
+    # Обновляем стату
+    conn.execute("UPDATE users SET rating_sum = rating_sum + ?, reviews_count = reviews_count + 1 WHERE tg_id = ?",
+                 (data['stars'], data['target_id']))
+    conn.commit()
+    conn.close()
     
+    await message.answer("✅ Отзыв успешно опубликован!", reply_markup=get_main_reply_kb(message.from_user.id))
     try:
-        await bot.send_message(data['target_id'], f"🌟 <b>Вам оставили новый отзыв!</b>\nОценка: {data['stars']} ⭐\nОтзыв: {message.text}")
+        await bot.send_message(data['target_id'], f"🌟 <b>Вам оставили новый отзыв!</b>\nОценка: {data['stars']} ⭐\nОтзыв: <i>{message.text}</i>")
     except: pass
     await state.clear()
 
-# ================= ПРИВЯЗКА И ЖАЛОБЫ =================
-@router.message(F.text == "🌟 Подать заявку на Гаранта", IsPrivate())
-async def apply_garant(message: Message):
-    with get_db() as conn:
-        conn.execute("INSERT INTO tickets (user_id, type) VALUES (?, 'garant_app')", (message.from_user.id,))
-        conn.commit()
-    await message.answer("✅ <b>Заявка на Гаранта отправлена!</b> Администратор изучит вашу статистику и примет решение.", reply_markup=get_main_reply_kb(message.from_user.id))
-    await bot.send_message(ADMIN_ID, f"🌟 <b>НОВАЯ ЗАЯВКА В ГАРАНТЫ!</b>\nОт: @{message.from_user.username}")
+# ==========================================
+# ОБРАБОТЧИКИ: КНОПКИ МЕНЮ (ЧЕКИ, СПИСКИ, ПОИСК)
+# ==========================================
+@router.message(F.text == "🧾 Создать чек", IsPrivate())
+async def create_receipt(message: Message):
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
+    conn.close()
+    
+    rating = format_rating(user['rating_sum'], user['reviews_count'])
+    text = (
+        f"🧾 <b>ОФИЦИАЛЬНЫЙ ЧЕК ТРЕЙДЕРА</b> 🧾\n\n"
+        f"👤 <b>Пользователь:</b> @{user['username']} (ID: <code>{user['tg_id']}</code>)\n"
+        f"🎮 <b>Roblox:</b> <code>{user['roblox_username']}</code>\n"
+        f"✅ <b>Успешных сделок:</b> {user['trades']}\n"
+        f"⭐️ <b>Рейтинг:</b> {rating}\n"
+        f"⚖️ <b>Статус:</b> {user['status'].upper()}\n\n"
+        f"<i>Верифицировано ботом AntiScam Pro 🛡</i>"
+    )
+    await message.answer(text)
 
-@router.message(F.text == "🔗 Привязать Roblox", IsPrivate())
-async def start_link_roblox(message: Message, state: FSMContext):
-    await message.answer("🔗 Отправьте <b>видео</b>, где вы заходите в свой профиль Roblox (нужно видеть ваш ник):", reply_markup=get_cancel_reply_kb())
-    await state.set_state(RobloxLink.waiting_for_video)
+@router.message(F.text == "🛡 Гаранты", IsPrivate())
+async def show_garants(message: Message):
+    conn = get_db()
+    garants = conn.execute("SELECT username, trades, rating_sum, reviews_count FROM users WHERE status = 'garant' ORDER BY trades DESC LIMIT 15").fetchall()
+    conn.close()
+    
+    if not garants:
+        return await message.answer("😔 Пока в базе нет официальных гарантов.")
+        
+    text = "🛡 <b>Список Официальных Гарантов:</b>\n\n"
+    for i, g in enumerate(garants, 1):
+        rating = format_rating(g['rating_sum'], g['reviews_count'])
+        text += f"{i}. <b>@{g['username']}</b> | Сделок: {g['trades']} | {rating}\n"
+        
+    await message.answer(text)
 
-@router.message(RobloxLink.waiting_for_video, F.video | F.animation | F.document, IsPrivate())
-async def process_video(message: Message, state: FSMContext):
-    with get_db() as conn:
-        conn.execute("INSERT INTO tickets (user_id, type, proof_msg_id) VALUES (?, 'roblox', ?)",
-                     (message.from_user.id, message.message_id))
-        conn.commit()
-    await message.answer("✅ Видео отправлено модераторам.", reply_markup=get_main_reply_kb(message.from_user.id))
+@router.message(F.text == "⚠️ Скамеры", IsPrivate())
+async def show_scammers(message: Message):
+    conn = get_db()
+    scammers = conn.execute("SELECT username, tg_id FROM users WHERE status = 'scammer' ORDER BY join_date DESC LIMIT 15").fetchall()
+    conn.close()
+        
+    if not scammers:
+        return await message.answer("🎉 База скамеров пока пуста! Так держать.")
+        
+    text = "🚨 <b>Последние заблокированные (ЧС):</b>\n\n"
+    for i, s in enumerate(scammers, 1):
+        text += f"☠️ @{s['username']} (<code>{s['tg_id']}</code>)\n"
+        
+    await message.answer(text)
+
+@router.message(F.text == "🏆 Топ", IsPrivate())
+async def show_top(message: Message):
+    conn = get_db()
+    top_users = conn.execute("SELECT username, trades, status FROM users WHERE status != 'scammer' ORDER BY trades DESC LIMIT 10").fetchall()
+    conn.close()
+        
+    if not top_users:
+        return await message.answer("Рейтинг пока пуст.")
+        
+    medals = ["🥇", "🥈", "🥉"]
+    text = "🏆 <b>ТОП-10 Трейдеров базы:</b>\n\n"
+    for i, u in enumerate(top_users):
+        medal = medals[i] if i < 3 else f"{i+1}."
+        status_emoji = "👑" if u['status'] == 'garant' else "🟢"
+        text += f"{medal} {status_emoji} <b>@{u['username']}</b> — {u['trades']} сделок\n"
+        
+    await message.answer(text)
+
+@router.message(F.text == "🔍 Проверить", IsPrivate())
+async def check_user_start(message: Message, state: FSMContext):
+    await message.answer("🔍 Введите <b>@username</b> или <b>ID</b> пользователя для проверки:", reply_markup=get_cancel_reply_kb())
+    await state.set_state(CheckUser.waiting_for_target)
+
+@router.message(CheckUser.waiting_for_target, IsPrivate())
+async def check_user_process(message: Message, state: FSMContext):
+    target = message.text.replace("@", "")
+    conn = get_db()
+    if target.isdigit():
+        user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (int(target),)).fetchone()
+    else:
+        user = conn.execute("SELECT * FROM users WHERE username = ? COLLATE NOCASE", (target,)).fetchone()
+    conn.close()
+    
+    if not user:
+        await message.answer("❓ Пользователь не найден в базе.", reply_markup=get_main_reply_kb(message.from_user.id))
+        return await state.clear()
+        
+    rating = format_rating(user['rating_sum'], user['reviews_count'])
+    title = get_user_title(user['trades'])
+    
+    text = (
+        f"📋 <b>Досье пользователя:</b>\n"
+        f"👤 @{user['username']} (<code>{user['tg_id']}</code>)\n"
+        f"🎮 Roblox: <code>{user['roblox_username']}</code>\n"
+        f"🏆 Титул: {title}\n"
+        f"🤝 Успешных сделок: <b>{user['trades']}</b>\n"
+        f"⭐️ Рейтинг: {rating}\n"
+    )
+    if user['status'] == 'scammer':
+        text = "‼️ <b>СКАМЕР ИЗ ЧС! БЕЗ СДЕЛОК!</b> ‼️\n\n" + text
+    elif user['status'] == 'garant':
+        text = "👑 <b>ОФИЦИАЛЬНЫЙ ГАРАНТ</b> 👑\n\n" + text
+        
+    await message.answer(text, reply_markup=get_main_reply_kb(message.from_user.id))
+    await state.clear()
+
+@router.message(F.text == "🛎 Вызвать Гаранта", IsPrivate())
+async def call_garant_start(message: Message, state: FSMContext):
+    await message.answer("🛎 Напишите условия сделки, и я отправлю их всем свободным Гарантам.\n\n<i>Пример: Я даю 1000 робуксов, мне дают пета в Adopt Me.</i>", reply_markup=get_cancel_reply_kb())
+    await state.set_state(CallGarant.waiting_for_details)
+
+@router.message(CallGarant.waiting_for_details, IsPrivate())
+async def call_garant_process(message: Message, state: FSMContext):
+    desc = message.text
+    conn = get_db()
+    garants = conn.execute("SELECT tg_id FROM users WHERE status = 'garant'").fetchall()
+    conn.close()
+        
+    if not garants:
+        await message.answer("😔 К сожалению, сейчас в базе нет доступных гарантов.", reply_markup=get_main_reply_kb(message.from_user.id))
+        return await state.clear()
+        
+    notified = 0
+    for g in garants:
+        try:
+            await bot.send_message(
+                g['tg_id'], 
+                f"🛎 <b>ВЫЗОВ ГАРАНТА</b>\nОт: @{message.from_user.username}\n\n<b>Условия:</b> <i>{desc}</i>\n\n👉 Свяжитесь с клиентом в ЛС, если готовы помочь."
+            )
+            notified += 1
+        except: pass
+        
+    await message.answer(f"✅ Заявка отправлена {notified} гарантам! Ожидайте сообщения в ЛС.", reply_markup=get_main_reply_kb(message.from_user.id))
+    await state.clear()
+
+# ==========================================
+# ОБРАБОТЧИКИ: ПРИВЯЗКА И ЖАЛОБЫ (ТИКЕТЫ)
+# ==========================================
+@router.message(F.text == "🎮 Привязать Roblox", IsPrivate())
+async def bind_roblox_start(message: Message, state: FSMContext):
+    await message.answer("📹 Чтобы привязать аккаунт, запишите короткое видео, где видно ваш Telegram профиль и переход в аккаунт Roblox, после чего отправьте его сюда.", reply_markup=get_cancel_reply_kb())
+    await state.set_state(BindRoblox.waiting_for_video)
+
+@router.message(BindRoblox.waiting_for_video, IsPrivate())
+async def bind_roblox_process(message: Message, state: FSMContext):
+    if not message.video:
+        return await message.answer("Пожалуйста, отправьте именно ВИДЕО.")
+        
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO tickets (user_id, type, content) VALUES (?, ?, ?)", (message.from_user.id, 'roblox_bind', message.video.file_id))
+    conn.commit()
+    conn.close()
+    
+    await message.answer("✅ Заявка отправлена администраторам на проверку!", reply_markup=get_main_reply_kb(message.from_user.id))
+    try:
+        await bot.send_message(ADMIN_ID, f"🔔 <b>Новая заявка на привязку Roblox!</b>\nОт: @{message.from_user.username}\nПроверьте в Админ-Панели.")
+    except: pass
     await state.clear()
 
 @router.message(F.text == "🚨 Подать жалобу", IsPrivate())
-async def report_scam_start(message: Message, state: FSMContext):
-    await message.answer("🚨 Введите <b>Telegram ID</b> или <b>@username</b> скамера:", reply_markup=get_cancel_reply_kb())
+async def report_user_start(message: Message, state: FSMContext):
+    await message.answer("🚨 Введите @username нарушителя:", reply_markup=get_cancel_reply_kb())
     await state.set_state(ReportUser.waiting_for_target)
 
 @router.message(ReportUser.waiting_for_target, IsPrivate())
-async def report_scam_id(message: Message, state: FSMContext):
-    await state.update_data(target_data=message.text.replace("@", ""))
-    await message.answer("Теперь отправьте <b>все доказательства (фото/видео + текст) одним сообщением</b>:")
+async def report_user_target(message: Message, state: FSMContext):
+    await state.update_data(target=message.text)
+    await message.answer("Теперь отправьте доказательства (текст с ссылками на видео/скрины):")
     await state.set_state(ReportUser.waiting_for_proofs)
 
 @router.message(ReportUser.waiting_for_proofs, IsPrivate())
-async def report_scam_proofs(message: Message, state: FSMContext):
+async def report_user_process(message: Message, state: FSMContext):
     data = await state.get_data()
-    with get_db() as conn:
-        conn.execute("INSERT INTO tickets (user_id, type, data, proof_msg_id) VALUES (?, 'report', ?, ?)",
-                     (message.from_user.id, data['target_data'], message.message_id))
-        conn.commit()
-    await message.answer("✅ Жалоба отправлена в Арбитраж.", reply_markup=get_main_reply_kb(message.from_user.id))
-    await state.clear()
-
-# ================= АДМИН ПАНЕЛЬ =================
-@router.message(F.text == "👑 Админ Панель", IsAdmin())
-async def admin_main(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("👑 <b>Enterprise Dashboard</b>", reply_markup=get_admin_main_kb())
-
-@router.callback_query(F.data.startswith("admin_tickets_"), IsAdmin())
-async def view_tickets(call: CallbackQuery):
-    ticket_type = call.data.split("_")[2] # roblox, report, garant_app
+    content = f"Нарушитель: {data['target']}\nПруфы: {message.text}"
     
-    with get_db() as conn:
-        ticket = conn.execute("SELECT * FROM tickets WHERE type=? AND status='pending' LIMIT 1", (ticket_type,)).fetchone()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO tickets (user_id, type, content) VALUES (?, ?, ?)", (message.from_user.id, 'report', content))
+    conn.commit()
+    conn.close()
+    
+    await message.answer("✅ Жалоба зарегистрирована. Администраторы рассмотрят её в ближайшее время.", reply_markup=get_main_reply_kb(message.from_user.id))
+    try:
+        await bot.send_message(ADMIN_ID, f"🔔 <b>Новая жалоба!</b>\nОт: @{message.from_user.username}\nНа: {data['target']}")
+    except: pass
+    await state.clear()
+
+# ==========================================
+# ОБРАБОТЧИКИ: АДМИН-ПАНЕЛЬ
+# ==========================================
+@router.message(F.text == "👑 Админ Панель", IsAdmin())
+async def admin_panel_start(message: Message):
+    conn = get_db()
+    tickets_roblox = conn.execute("SELECT COUNT(*) FROM tickets WHERE type='roblox_bind' AND status='pending'").fetchone()[0]
+    tickets_reports = conn.execute("SELECT COUNT(*) FROM tickets WHERE type='report' AND status='pending'").fetchone()[0]
+    conn.close()
+    
+    text = (
+        "👑 <b>Enterprise Dashboard</b>\n\n"
+        f"🎫 Ожидают привязки Roblox: <b>{tickets_roblox}</b>\n"
+        f"🚨 Неразобранные жалобы: <b>{tickets_reports}</b>\n\n"
+        "Выберите действие ниже:"
+    )
+    await message.answer(text, reply_markup=get_admin_main_kb())
+
+@router.callback_query(F.data == "admin_cancel", IsAdmin())
+async def admin_cancel_call(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await admin_panel_start(call.message)
+    await call.answer()
+
+@router.callback_query(F.data == "admin_stats", IsAdmin())
+async def admin_stats_panel(call: CallbackQuery):
+    conn = get_db()
+    total_u = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_t = conn.execute("SELECT SUM(trades) FROM users").fetchone()[0] or 0
+    total_s = conn.execute("SELECT COUNT(*) FROM users WHERE status='scammer'").fetchone()[0]
+    garants = conn.execute("SELECT COUNT(*) FROM users WHERE status='garant'").fetchone()[0]
+    conn.close()
+        
+    text = (
+        f"📊 <b>Статистика Enterprise Bot:</b>\n\n"
+        f"👥 Всего юзеров: <b>{total_u}</b>\n"
+        f"🤝 Успешных сделок (всего): <b>{total_t}</b>\n"
+        f"🛡 Гарантов: <b>{garants}</b>\n"
+        f"☠️ Скамеров в ЧС: <b>{total_s}</b>"
+    )
+    await call.message.edit_text(text, reply_markup=get_admin_main_kb())
+    await call.answer()
+
+@router.callback_query(F.data == "admin_backup_db", IsAdmin())
+async def admin_backup_panel(call: CallbackQuery):
+    try:
+        await bot.send_document(ADMIN_ID, FSInputFile(DB_NAME), caption="💾 Ручной бэкап БД.")
+        await call.answer("✅ Бэкап отправлен в ЛС.")
+    except Exception as e:
+        await call.answer(f"❌ Ошибка: {e}", show_alert=True)
+
+# ПОИСК ЮЗЕРА АДМИНОМ
+@router.callback_query(F.data == "admin_search_user", IsAdmin())
+async def admin_search_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("🔍 <b>Админ Поиск</b>\nВведите @username или Telegram ID юзера:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin_cancel")]]))
+    await state.set_state(AdminPanelStates.waiting_for_user_search)
+    await call.answer()
+
+@router.message(AdminPanelStates.waiting_for_user_search, IsAdmin())
+async def admin_search_process(message: Message, state: FSMContext):
+    target = message.text.replace("@", "")
+    conn = get_db()
+    if target.isdigit():
+        user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (int(target),)).fetchone()
+    else:
+        user = conn.execute("SELECT * FROM users WHERE username = ? COLLATE NOCASE", (target,)).fetchone()
+    conn.close()
+            
+    if not user:
+        return await message.answer("❌ Юзер не найден.", reply_markup=get_admin_main_kb())
+        
+    text = (f"👤 Юзер: @{user['username']} (ID: <code>{user['tg_id']}</code>)\n"
+            f"Статус: {user['status'].upper()}\nСделок: {user['trades']}")
+            
+    await message.answer(text, reply_markup=get_admin_user_manage_kb(user['tg_id'], user['status']))
+    await state.clear()
+
+# ИЗМЕНЕНИЕ СТАТУСОВ АДМИНОМ
+@router.callback_query(F.data.startswith("admset_") | F.data.startswith("admadd_") | F.data.startswith("admclr_"), IsAdmin())
+async def admin_manage_user(call: CallbackQuery):
+    action, target_id = call.data.split("_")[1], int(call.data.split("_")[2])
+    conn = sqlite3.connect(DB_NAME)
+    
+    if action == "scammer":
+        conn.execute("UPDATE users SET status = 'scammer' WHERE tg_id = ?", (target_id,))
+        text = "☠️ Юзер добавлен в ЧС!"
+    elif action == "garant":
+        conn.execute("UPDATE users SET status = 'garant' WHERE tg_id = ?", (target_id,))
+        text = "👑 Юзер теперь Гарант!"
+    elif action == "user":
+        conn.execute("UPDATE users SET status = 'user' WHERE tg_id = ?", (target_id,))
+        text = "👤 Статус сброшен на Обычный."
+    elif action == "trade":
+        conn.execute("UPDATE users SET trades = trades + 1 WHERE tg_id = ?", (target_id,))
+        text = "✅ Начислена 1 сделка."
+    elif action == "stats":
+        conn.execute("UPDATE users SET trades = 0, rating_sum = 0, reviews_count = 0 WHERE tg_id = ?", (target_id,))
+        text = "🧹 Вся статистика очищена."
+        
+    conn.commit()
+    conn.close()
+    await call.answer(text, show_alert=True)
+    await admin_panel_start(call.message)
+
+# ТИКЕТЫ: ПРОСМОТР
+@router.callback_query(F.data.startswith("admin_tickets_"), IsAdmin())
+async def admin_view_tickets(call: CallbackQuery, state: FSMContext):
+    t_type = call.data.split("_")[2]
+    db_type = 'roblox_bind' if t_type == 'roblox' else 'report'
+    
+    conn = get_db()
+    ticket = conn.execute("SELECT * FROM tickets WHERE type=? AND status='pending' LIMIT 1", (db_type,)).fetchone()
+    conn.close()
     
     if not ticket:
-        return await call.answer("🎉 Тикетов в этой категории нет!", show_alert=True)
+        return await call.answer("✅ Новых тикетов в этой категории нет.", show_alert=True)
         
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"ticket_appr_{ticket['id']}_{ticket_type}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"ticket_rej_{ticket['id']}_{ticket_type}")
-    ]])
-
-    text = f"🎫 <b>Тикет #{ticket['id']} ({ticket_type.upper()})</b>\nОт ID: <code>{ticket['user_id']}</code>\n"
-    if ticket['data']: text += f"Цель: {ticket['data']}\n"
-
-    await call.message.edit_text(text, reply_markup=kb)
+    await state.set_state(AdminPanelStates.target_ticket_id)
+    await state.update_data(ticket_id=ticket['id'], user_id=ticket['user_id'])
     
-    if ticket['proof_msg_id']:
-        try:
-            await bot.copy_message(chat_id=ADMIN_ID, from_chat_id=ticket['user_id'], message_id=ticket['proof_msg_id'])
-        except:
-            await bot.send_message(ADMIN_ID, "❌ Ошибка загрузки медиа.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Одобрить / Ответить", callback_data=f"adm_t_accept_{ticket['id']}"),
+         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_t_decline_{ticket['id']}")]
+    ])
+    
+    if db_type == 'roblox_bind':
+        await bot.send_video(ADMIN_ID, ticket['content'], caption=f"🎫 <b>Привязка Roblox</b>\nОт ID: {ticket['user_id']}", reply_markup=kb)
+    else:
+        await bot.send_message(ADMIN_ID, f"🚨 <b>Жалоба</b>\nОт ID: {ticket['user_id']}\n\n{ticket['content']}", reply_markup=kb)
     await call.answer()
 
-@router.callback_query(F.data.startswith("ticket_"), IsAdmin())
-async def resolve_ticket(call: CallbackQuery, state: FSMContext):
-    action, t_id, t_type = call.data.split("_")[1], int(call.data.split("_")[2]), call.data.split("_")[3]
-    
-    with get_db() as conn:
-        conn.execute("UPDATE tickets SET status = ? WHERE id = ?", ('resolved' if action == 'appr' else 'rejected', t_id))
-        ticket = conn.execute("SELECT user_id FROM tickets WHERE id = ?", (t_id,)).fetchone()
-        conn.commit()
-    
-    user_id = ticket['user_id']
-    
-    if action == "rej":
-        await bot.send_message(user_id, f"❌ Ваша заявка ({t_type}) отклонена.")
-        await call.message.edit_text(f"✅ Тикет #{t_id} отклонен.", reply_markup=get_admin_main_kb())
-        return await call.answer()
-        
-    if t_type == "roblox":
-        AdminPanelStates.target_ticket_id = user_id
-        await call.message.edit_text("✅ Введите Ник и ID для пользователя в формате:\n<code>MyNick 123456</code>")
-        await state.set_state(AdminPanelStates.waiting_for_roblox_data)
-    elif t_type == "report":
-        await call.message.edit_text(f"✅ Репорт одобрен. Найдите скамера через поиск и забаньте.", reply_markup=get_admin_main_kb())
-    elif t_type == "garant_app":
-        with get_db() as conn:
-            conn.execute("UPDATE users SET status = 'garant' WHERE tg_id = ?", (user_id,))
-            conn.commit()
-        log_admin_action(call.from_user.id, "approved_garant", user_id)
-        await bot.send_message(user_id, "🎉 <b>ПОЗДРАВЛЯЕМ!</b> Ваша заявка одобрена. Вы стали Официальным Гарантом!")
-        await call.message.edit_text(f"✅ Пользователю {user_id} выдан статус Гаранта.", reply_markup=get_admin_main_kb())
+@router.callback_query(F.data.startswith("adm_t_decline_"), IsAdmin())
+async def admin_ticket_decline(call: CallbackQuery):
+    t_id = int(call.data.split("_")[3])
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("UPDATE tickets SET status='closed' WHERE id=?", (t_id,))
+    conn.commit()
+    conn.close()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.answer("❌ Тикет закрыт.")
 
-    await call.answer()
+@router.callback_query(F.data.startswith("adm_t_accept_"), IsAdmin())
+async def admin_ticket_accept(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    t_id = data.get('ticket_id')
+    user_id = data.get('user_id')
+    
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("UPDATE tickets SET status='closed' WHERE id=?", (t_id,))
+    conn.commit()
+    conn.close()
+    
+    await call.message.edit_reply_markup(reply_markup=None)
+    # Если это привязка роблокса, просим ввести ник
+    await call.message.answer("Введите Ник и ID Roblox через пробел (Пример: Masha2010 1234567):")
+    await state.set_state(AdminPanelStates.waiting_for_roblox_data)
 
 @router.message(AdminPanelStates.waiting_for_roblox_data, IsAdmin())
-async def save_roblox_data(message: Message, state: FSMContext):
+async def admin_save_roblox_data(message: Message, state: FSMContext):
     try:
         rbx_nick, rbx_id = message.text.split()
-        target_id = AdminPanelStates.target_ticket_id
-        with get_db() as conn:
-            conn.execute("UPDATE users SET roblox_username = ?, roblox_id = ? WHERE tg_id = ?", (rbx_nick, rbx_id, target_id))
-            conn.commit()
-        log_admin_action(message.from_user.id, "linked_roblox", target_id)
+        data = await state.get_data()
+        target_id = data.get('user_id')
+        
+        conn = sqlite3.connect(DB_NAME)
+        conn.execute("UPDATE users SET roblox_username = ?, roblox_id = ? WHERE tg_id = ?", (rbx_nick, rbx_id, target_id))
+        conn.commit()
+        conn.close()
         
         await message.answer("✅ Данные привязаны!", reply_markup=get_admin_main_kb())
-        await bot.send_message(target_id, f"🎉 <b>Roblox привязан!</b>\nНик: {rbx_nick}\nID: {rbx_id}")
+        try:
+            await bot.send_message(target_id, f"🎉 <b>Roblox успешно привязан!</b>\nНик: {rbx_nick}\nID: {rbx_id}")
+        except: pass
         await state.clear()
     except Exception:
         await message.answer("❌ Ошибка формата. Нужно: Ник ID")
 
-@router.callback_query(F.data.startswith("admset_") | F.data.startswith("admadd_") | F.data.startswith("admclr_"), IsAdmin())
-async def admin_edit_user(call: CallbackQuery):
-    parts = call.data.split("_")
-    action_type, target_id = parts[0], int(parts[2])
+# ==========================================
+# ЗАЩИТА ГРУПП (GROUP SHIELD)
+# ==========================================
+@router.message(~IsPrivate())
+async def group_shield_handler(message: Message):
+    if not message.from_user: return
     
-    with get_db() as conn:
-        if action_type == "admset":
-            conn.execute("UPDATE users SET status = ? WHERE tg_id = ?", (parts[1], target_id))
-            log_admin_action(call.from_user.id, f"set_status_{parts[1]}", target_id)
-        elif action_type == "admadd":
-            conn.execute("UPDATE users SET trades = trades + ? WHERE tg_id = ?", (int(parts[3]), target_id))
-            log_admin_action(call.from_user.id, f"add_trades_{parts[3]}", target_id)
-        elif action_type == "admclr":
-            conn.execute("UPDATE users SET scams = 0, status = 'user' WHERE tg_id = ?", (target_id,))
-            log_admin_action(call.from_user.id, "cleared_scams", target_id)
-        conn.commit()
-        
-    await call.answer("✅ База обновлена!", show_alert=True)
-    await call.message.delete()
-
-# ================= GROUP SHIELD (АВТОМОДЕРАЦИЯ) =================
-@router.message(Command("check"), IsGroup())
-async def group_check_command(message: Message):
-    args = message.text.split()
-    if len(args) < 2: return await message.reply("Использование: <code>/check @username</code>")
-    target = args[1].replace("@", "")
-    
-    with get_db() as conn:
-        if target.isdigit():
-            user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (int(target),)).fetchone()
-        else:
-            user = conn.execute("SELECT * FROM users WHERE tg_username = ? COLLATE NOCASE", (target,)).fetchone()
-
-    if not user: return await message.reply("❓ Неизвестный пользователь.")
-    
-    text = (f"📋 <b>Досье на {user['tg_username']}:</b>\n"
-            f"Сделок: {user['trades']} | Рейтинг: {format_rating(user['rating_sum'], user['reviews_count'])}\n")
-    if user['status'] == 'scammer': text = "‼️ <b>СКАМЕР ИЗ ЧС! БЕЗ СДЕЛОК!</b> ‼️\n" + text
-    await message.reply(text)
-
-@router.message(IsGroup())
-async def group_message_monitor(message: Message):
-    with get_db() as conn:
-        user = conn.execute("SELECT status FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
+    conn = get_db()
+    user = conn.execute("SELECT status FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
+    conn.close()
     
     if user and user['status'] == 'scammer':
         try:
             await message.delete()
-            warn = await message.answer(f"⚠️ Сообщение от @{message.from_user.username} удалено. <b>СКАМЕР В БАЗЕ!</b>")
-            await asyncio.sleep(10)
-            await warn.delete()
-        except TelegramBadRequest: pass
+            # Можно добавить await message.chat.ban(message.from_user.id) для полного бана
+        except: pass # Бот не имеет прав администратора в группе
 
-# ================= АВТОБЭКАПЫ =================
-async def auto_backup_loop():
+# ==========================================
+# ЗАПУСК БОТА И АВТО-БЭКАПЫ
+# ==========================================
+async def auto_backup():
     while True:
         await asyncio.sleep(3600) # Каждый час
         try:
-            if os.path.exists("antiscam_pro.db"):
-                await bot.send_document(ADMIN_ID, FSInputFile("antiscam_pro.db"), caption="🕒 Авто-бэкап БД.")
+            await bot.send_document(ADMIN_ID, FSInputFile(DB_NAME), caption="💾 Автоматический ежечасный бэкап БД.")
         except: pass
 
 async def main():
-    init_db()
-    await setup_bot_commands()
-    asyncio.create_task(auto_backup_loop())
-    print("🚀 AntiScam Enterprise Bot запущен (v3.0)!")
+    dp.include_router(router)
+    print("Бот успешно запущен!")
+    # Запускаем авто-бэкап как фоновую задачу
+    asyncio.create_task(auto_backup())
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
