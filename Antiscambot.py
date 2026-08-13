@@ -34,7 +34,7 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # 1. Основная таблица пользователей (с новыми полями role и badges)
+    # Основная таблица пользователей
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             tg_id INTEGER PRIMARY KEY,
@@ -59,7 +59,7 @@ def init_db():
     if 'badges' not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN badges TEXT DEFAULT ''")
     
-    # 2. Таблица логов P2P сделок
+    # Таблица логов P2P сделок
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS trades_p2p (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,7 +70,7 @@ def init_db():
         )
     ''')
     
-    # 3. Таблица отзывов
+    # Таблица отзывов
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS reviews (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,7 +82,7 @@ def init_db():
         )
     ''')
     
-    # 4. Таблица тикетов (привязки и жалобы)
+    # Таблица тикетов (привязки и жалобы)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS tickets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,7 +94,7 @@ def init_db():
         )
     ''')
     
-    # 5. Таблица логов аудита (Для безопасности: кто из админов/модеров что делал)
+    # Таблица логов аудита
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,11 +160,11 @@ ACHIEVEMENTS = {
 }
 
 async def check_achievements(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
+    conn = get_db()
     user = conn.execute("SELECT trades, status, rating_sum, reviews_count, badges FROM users WHERE tg_id = ?", (user_id,)).fetchone()
     
     if not user:
+        conn.close()
         return
         
     current_badges = user['badges'].split(',') if user['badges'] else []
@@ -178,7 +178,7 @@ async def check_achievements(user_id):
         new_badges.append("fifty_trades")
         
     avg = user['rating_sum'] / user['reviews_count'] if user['reviews_count'] > 0 else 0
-    if avg == 5.0 and user['reviews_count'] >= 10 and "flawless" not in current_badges:
+    if avg >= 4.9 and user['reviews_count'] >= 10 and "flawless" not in current_badges:
         new_badges.append("flawless")
         
     if user['status'] == 'garant' and "garant" not in current_badges:
@@ -189,7 +189,6 @@ async def check_achievements(user_id):
         badges_str = ",".join(updated_badges)
         conn.execute("UPDATE users SET badges = ? WHERE tg_id = ?", (badges_str, user_id))
         conn.commit()
-        # Уведомляем пользователя о новых наградах
         for badge in new_badges:
             try:
                 await bot.send_message(user_id, f"🏆 <b>Новое достижение разблокировано!</b>\nВы получили бейдж: <b>{ACHIEVEMENTS[badge]}</b>\n\n<i>Теперь он будет отображаться в вашем профиле и чеках!</i>")
@@ -214,7 +213,7 @@ def get_user_title(trades):
 
 def get_progress_bar(trades):
     if trades >= 100: return "[██████████] MAX"
-    percent = trades % 10
+    percent = (trades % 10)
     return f"[{'█' * percent}{'░' * (10 - percent)}] {percent * 10}% до некст ранга"
 
 # ==========================================
@@ -253,7 +252,6 @@ def get_admin_main_kb(is_superadmin=False):
 
 def get_admin_user_manage_kb(target_id, current_status, current_role, is_superadmin=False):
     buttons = []
-    # Модераторы могут выдавать ЧС, сбрасывать статусы и накручивать сделки.
     if current_status != 'scammer':
         buttons.append([InlineKeyboardButton(text="☠️ В ЧС (Скам)", callback_data=f"admset_scammer_{target_id}")])
     if current_status != 'garant':
@@ -265,14 +263,6 @@ def get_admin_user_manage_kb(target_id, current_status, current_role, is_superad
         InlineKeyboardButton(text="➕ 1 Сделка", callback_data=f"admadd_trade_{target_id}"),
         InlineKeyboardButton(text="🧹 Обнулить", callback_data=f"admclr_stats_{target_id}")
     ])
-    
-    # Только супер-админ может менять РОЛИ (нанимать модеров)
-    if is_superadmin:
-        if current_role == 'user':
-            buttons.append([InlineKeyboardButton(text="👔 Назначить Модератором", callback_data=f"admrole_moderator_{target_id}")])
-        elif current_role == 'moderator':
-            buttons.append([InlineKeyboardButton(text="📉 Разжаловать Модератора", callback_data=f"admrole_user_{target_id}")])
-            
     buttons.append([InlineKeyboardButton(text="◀️ Назад в Админку", callback_data="admin_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -294,7 +284,11 @@ class AppStates(StatesGroup):
     admin_waiting_user_search = State()
     admin_waiting_roblox_data = State()
     admin_waiting_broadcast_msg = State()
-    admin_waiting_staff_search = State()
+    
+    # Стейты управления персоналом
+    admin_waiting_add_mod = State()
+    admin_waiting_rem_mod = State()
+    
     target_ticket_id = None
 
 # ==========================================
@@ -312,7 +306,6 @@ async def cmd_start(message: Message, state: FSMContext):
         role = "user"
     else:
         role = user['role']
-        # Обновляем юзернейм на случай, если он поменялся
         conn.execute("UPDATE users SET username = ? WHERE tg_id = ?", (message.from_user.username or "Без_Ника", message.from_user.id))
         conn.commit()
     conn.close()
@@ -325,6 +318,7 @@ async def cmd_start(message: Message, state: FSMContext):
         reply_markup=get_main_reply_kb(role)
     )
 
+@router.message(Command("cancel"))
 @router.message(F.text == "❌ Отмена", IsPrivate())
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
@@ -332,7 +326,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
     user = conn.execute("SELECT role FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
     conn.close()
     role = user['role'] if user else 'user'
-    await message.answer("Действие отменено.", reply_markup=get_main_reply_kb(role))
+    await message.answer("✅ Действие отменено. Вы вернулись в главное меню.", reply_markup=get_main_reply_kb(role))
 
 @router.message(F.text == "👤 Профиль", IsPrivate())
 async def show_profile(message: Message):
@@ -378,7 +372,7 @@ async def create_receipt(message: Message):
     
     rating = format_rating(user['rating_sum'], user['reviews_count'])
     badges_list = user['badges'].split(',') if user['badges'] else []
-    badges_display = " | ".join([ACHIEVEMENTS.get(b, '').split()[0] for b in badges_list if b in ACHIEVEMENTS]) # Только эмодзи
+    badges_display = " | ".join([ACHIEVEMENTS.get(b, '').split()[0] for b in badges_list if b in ACHIEVEMENTS])
     
     text = (
         f"🧾 <b>ОФИЦИАЛЬНЫЙ ЧЕК ТРЕЙДЕРА</b> 🧾\n\n"
@@ -422,6 +416,9 @@ async def p2p_trade_process(message: Message, state: FSMContext):
     cursor.execute("INSERT INTO trades_p2p (initiator_id, partner_id) VALUES (?, ?)", (message.from_user.id, partner['tg_id']))
     trade_id = cursor.lastrowid
     conn.commit()
+    
+    user_me = conn.execute("SELECT role FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
+    role = user_me['role'] if user_me else 'user'
     conn.close()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -431,9 +428,9 @@ async def p2p_trade_process(message: Message, state: FSMContext):
     
     try:
         await bot.send_message(partner['tg_id'], f"🤝 <b>Новый запрос на сделку!</b>\nПользователь @{message.from_user.username} утверждает, что провел с вами успешный трейд.\nПодтверждаете?", reply_markup=kb)
-        await message.answer("✅ Запрос отправлен партнеру. Ожидайте подтверждения.", reply_markup=get_main_reply_kb('user'))
+        await message.answer("✅ Запрос отправлен партнеру. Ожидайте подтверждения.", reply_markup=get_main_reply_kb(role))
     except:
-        await message.answer("❌ Не удалось отправить сообщение партнеру (бот заблокирован).", reply_markup=get_main_reply_kb('user'))
+        await message.answer("❌ Не удалось отправить сообщение партнеру (бот заблокирован или юзер не запускал бота).", reply_markup=get_main_reply_kb(role))
     
     await state.clear()
 
@@ -452,12 +449,14 @@ async def p2p_accept(call: CallbackQuery):
     conn.commit()
     conn.close()
     
-    await call.message.edit_text("✅ Сделка подтверждена! Вам обоим начислена +1 сделка в статистику.")
+    try:
+        await call.message.edit_text("✅ Сделка подтверждена! Вам обоим начислена +1 сделка в статистику.")
+    except TelegramBadRequest: pass
+    
     try:
         await bot.send_message(trade[1], "🎉 Партнер подтвердил сделку! Вам начислена +1 сделка.")
     except: pass
     
-    # Проверка на выдачу ачивок
     await check_achievements(trade[1])
     await check_achievements(trade[2])
 
@@ -468,7 +467,9 @@ async def p2p_decline(call: CallbackQuery):
     conn.execute("UPDATE trades_p2p SET status = 'declined' WHERE id = ?", (trade_id,))
     conn.commit()
     conn.close()
-    await call.message.edit_text("❌ Вы отклонили сделку.")
+    try:
+        await call.message.edit_text("❌ Вы отклонили сделку.")
+    except TelegramBadRequest: pass
 
 # ==========================================
 # ОБРАБОТЧИКИ: ОТЗЫВЫ И РЕЙТИНГИ
@@ -526,7 +527,6 @@ async def review_text(message: Message, state: FSMContext):
     conn.execute("UPDATE users SET rating_sum = rating_sum + ?, reviews_count = reviews_count + 1 WHERE tg_id = ?",
                  (data['stars'], data['target_id']))
     
-    # Получаем роль пользователя для правильной клавиатуры
     user = conn.execute("SELECT role FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
     role = user[0] if user else 'user'
     
@@ -603,9 +603,8 @@ async def call_garant_process(message: Message, state: FSMContext):
     desc = message.text
     conn = get_db()
     garants = conn.execute("SELECT tg_id FROM users WHERE status = 'garant'").fetchall()
-    
     user = conn.execute("SELECT role FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
-    role = user[0] if user else 'user'
+    role = user['role'] if user else 'user'
     conn.close()
         
     if not garants:
@@ -679,13 +678,12 @@ async def report_user_process(message: Message, state: FSMContext):
     await state.clear()
 
 # ==========================================
-# ОБРАБОТЧИКИ: ЗАЩИТА ГРУПП (GROUP SHIELD) И КОМАНДЫ
+# ОБРАБОТЧИКИ: ПРОВЕРКА И ЗАЩИТА ГРУПП (GROUP SHIELD)
 # ==========================================
 @router.message(Command("check"))
 @router.message(F.text == "🔍 Проверить")
 async def check_user_start(message: Message, state: FSMContext):
     if message.chat.type != "private":
-        # Если вызвано в группе через /check @username
         parts = message.text.split()
         if len(parts) < 2:
             return await message.reply("Использование: <code>/check @username</code> или <code>/check ID</code>")
@@ -718,7 +716,6 @@ async def send_check_result(message: Message, target: str, state: FSMContext = N
             return await message.reply(text)
     
     conn.close()
-    
     rating = format_rating(user['rating_sum'], user['reviews_count'])
     title = get_user_title(user['trades'])
     
@@ -744,12 +741,21 @@ async def send_check_result(message: Message, target: str, state: FSMContext = N
     else:
         await message.reply(text)
 
-# АВТО-ЗАЩИТА В ЧАТАХ (Удаление спама от скамеров)
+@router.message(Command("ban"), IsModOrAdmin(), F.chat.type.in_({'group', 'supergroup'}))
+async def group_ban_command(message: Message):
+    if not message.reply_to_message:
+        return await message.reply("Ответьте на сообщение пользователя командой /ban, чтобы забанить его в этой группе.")
+    target_id = message.reply_to_message.from_user.id
+    try:
+        await bot.ban_chat_member(chat_id=message.chat.id, user_id=target_id)
+        await message.reply("🔨 Пользователь успешно забанен администратором/модератором.")
+    except Exception as e:
+        await message.reply(f"❌ Не удалось забанить. Возможно, у меня нет прав. Ошибка: {e}")
+
 @router.message(F.chat.type.in_({'group', 'supergroup'}))
 async def group_shield_handler(message: Message):
     if not message.from_user: return
     
-    # 1. Записываем юзера в базу, если его нет (пассивный сбор)
     conn = get_db()
     user = conn.execute("SELECT status, username FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
     
@@ -760,17 +766,13 @@ async def group_shield_handler(message: Message):
         conn.execute("UPDATE users SET username = ? WHERE tg_id = ?", (message.from_user.username, message.from_user.id))
         conn.commit()
         
-    # 2. Если это скамер, караем
     if user and user['status'] == 'scammer':
         try:
-            await message.delete() # Удаляем его сообщение
-            # Пытаемся забанить, если бот - админ
-            await message.chat.ban_sender_chat(message.from_user.id) 
-            await message.chat.restrict(message.from_user.id, ChatPermissions(can_send_messages=False))
-            await message.answer(f"🚨 <b>СКАМЕР ОБНАРУЖЕН И УСТРАНЕН!</b>\nУчастник @{message.from_user.username} числится в Черном Списке.")
+            await message.delete() 
+            await bot.ban_chat_member(chat_id=message.chat.id, user_id=message.from_user.id)
+            await message.answer(f"🚨 <b>СКАМЕР ОБНАРУЖЕН И УСТРАНЕН!</b>\nУчастник @{message.from_user.username} числится в Черном Списке. Бот удалил его из группы.")
         except:
-            # Если у бота нет прав удалять/банить, просто предупреждаем чат
-            await message.answer(f"⚠️ <b>ВНИМАНИЕ ЧАТУ!</b>\nЭтот участник (@{message.from_user.username}) находится в глобальной базе скамеров! Выдайте боту права администратора для авто-бана.")
+            await message.answer(f"⚠️ <b>ВНИМАНИЕ ЧАТУ!</b>\nЭтот участник (@{message.from_user.username}) находится в глобальной базе скамеров! Выдайте боту права администратора (Ban Users), чтобы он автоматически удалял таких людей.")
     conn.close()
 
 # ==========================================
@@ -799,7 +801,9 @@ async def admin_panel_start(message: Message):
 @router.callback_query(F.data == "admin_cancel", IsModOrAdmin())
 async def admin_cancel_call(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.delete()
+    try:
+        await call.message.delete()
+    except TelegramBadRequest: pass
     await admin_panel_start(call.message)
     await call.answer()
 
@@ -823,10 +827,102 @@ async def admin_stats_panel(call: CallbackQuery):
         f"👮‍♂️ Модераторов: <b>{mods}</b>\n"
         f"☠️ Скамеров в ЧС: <b>{total_s}</b>"
     )
-    await call.message.edit_text(text, reply_markup=get_admin_main_kb(is_super))
+    try:
+        await call.message.edit_text(text, reply_markup=get_admin_main_kb(is_super))
+    except TelegramBadRequest: pass
     await call.answer()
 
-# ПОИСК ЮЗЕРА АДМИНОМ / МОДЕРОМ
+# === УПРАВЛЕНИЕ ПЕРСОНАЛОМ (HR МОДУЛЬ) ===
+@router.callback_query(F.data == "admin_staff_manage", IsSuperAdmin())
+async def admin_staff_manage_panel(call: CallbackQuery, state: FSMContext):
+    conn = get_db()
+    mods = conn.execute("SELECT tg_id, username FROM users WHERE role = 'moderator'").fetchall()
+    conn.close()
+
+    text = "🛡 <b>Управление Персоналом (Модераторы)</b>\n\n<b>Текущий состав:</b>\n"
+    if mods:
+        for mod in mods:
+            text += f"• @{mod['username']} (<code>{mod['tg_id']}</code>)\n"
+    else:
+        text += "<i>Нет назначенных модераторов.</i>\n"
+
+    text += "\n👇 <i>Выберите действие:</i>"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Назначить модератора", callback_data="admin_add_mod_start")],
+        [InlineKeyboardButton(text="➖ Разжаловать модератора", callback_data="admin_rem_mod_start")],
+        [InlineKeyboardButton(text="◀️ Назад в Админку", callback_data="admin_cancel")]
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest: pass
+    await call.answer()
+
+@router.callback_query(F.data == "admin_add_mod_start", IsSuperAdmin())
+async def add_mod_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("👤 Введите <b>@username</b> или <b>ID</b> пользователя, которого хотите назначить МОДЕРАТОРОМ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_staff_manage")]]))
+    await state.set_state(AppStates.admin_waiting_add_mod)
+    await call.answer()
+
+@router.message(AppStates.admin_waiting_add_mod, IsSuperAdmin())
+async def add_mod_process(message: Message, state: FSMContext):
+    target = message.text.replace("@", "")
+    conn = get_db()
+    if target.isdigit():
+        user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (int(target),)).fetchone()
+    else:
+        user = conn.execute("SELECT * FROM users WHERE username = ? COLLATE NOCASE", (target,)).fetchone()
+
+    if not user:
+        conn.close()
+        return await message.answer("❌ Пользователь не найден в базе.")
+
+    if user['role'] == 'admin':
+        conn.close()
+        return await message.answer("❌ Это Супер-Админ. Его нельзя понизить до модератора таким образом.")
+
+    conn.execute("UPDATE users SET role = 'moderator' WHERE tg_id = ?", (user['tg_id'],))
+    conn.commit()
+    conn.close()
+
+    log_audit(message.from_user.id, "Promoted to moderator", user['tg_id'])
+    await message.answer(f"✅ Пользователь @{user['username']} успешно назначен модератором!", reply_markup=get_admin_main_kb(True))
+    try:
+        await bot.send_message(user['tg_id'], "🎉 <b>Поздравляем!</b> Вы были назначены Модератором проекта. Введите /start чтобы обновить клавиатуру и получить доступ к панели.")
+    except: pass
+    await state.clear()
+
+@router.callback_query(F.data == "admin_rem_mod_start", IsSuperAdmin())
+async def rem_mod_start(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text("📉 Введите <b>@username</b> или <b>ID</b> модератора для разжалования:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_staff_manage")]]))
+    await state.set_state(AppStates.admin_waiting_rem_mod)
+    await call.answer()
+
+@router.message(AppStates.admin_waiting_rem_mod, IsSuperAdmin())
+async def rem_mod_process(message: Message, state: FSMContext):
+    target = message.text.replace("@", "")
+    conn = get_db()
+    if target.isdigit():
+        user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (int(target),)).fetchone()
+    else:
+        user = conn.execute("SELECT * FROM users WHERE username = ? COLLATE NOCASE", (target,)).fetchone()
+
+    if not user or user['role'] != 'moderator':
+        conn.close()
+        return await message.answer("❌ Пользователь не найден или не является модератором.")
+
+    conn.execute("UPDATE users SET role = 'user' WHERE tg_id = ?", (user['tg_id'],))
+    conn.commit()
+    conn.close()
+
+    log_audit(message.from_user.id, "Demoted moderator", user['tg_id'])
+    await message.answer(f"✅ Пользователь @{user['username']} разжалован до обычного юзера.", reply_markup=get_admin_main_kb(True))
+    try:
+        await bot.send_message(user['tg_id'], "📉 Вы были лишены прав модератора.")
+    except: pass
+    await state.clear()
+
+# === ПОИСК И УПРАВЛЕНИЕ ЮЗЕРАМИ ===
 @router.callback_query(F.data == "admin_search_user", IsModOrAdmin())
 async def admin_search_start(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("🔍 <b>Админ Поиск</b>\nВведите @username или Telegram ID юзера:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_cancel")]]))
@@ -856,8 +952,7 @@ async def admin_search_process(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=get_admin_user_manage_kb(user['tg_id'], user['status'], user['role'], is_super))
     await state.clear()
 
-# ИЗМЕНЕНИЕ СТАТУСОВ АДМИНОМ/МОДЕРОМ
-@router.callback_query(F.data.startswith("admset_") | F.data.startswith("admadd_") | F.data.startswith("admclr_") | F.data.startswith("admrole_"), IsModOrAdmin())
+@router.callback_query(F.data.startswith("admset_") | F.data.startswith("admadd_") | F.data.startswith("admclr_"), IsModOrAdmin())
 async def admin_manage_user(call: CallbackQuery):
     parts = call.data.split("_")
     action_type = parts[0]
@@ -867,10 +962,6 @@ async def admin_manage_user(call: CallbackQuery):
     conn = sqlite3.connect(DB_NAME)
     staff = conn.execute("SELECT role FROM users WHERE tg_id = ?", (call.from_user.id,)).fetchone()
     is_super = staff[0] == 'admin'
-    
-    if action_type == "admrole" and not is_super:
-        conn.close()
-        return await call.answer("⛔ У вас нет прав изменять роли персонала.", show_alert=True)
     
     if action_type == "admset":
         conn.execute("UPDATE users SET status = ? WHERE tg_id = ?", (action, target_id))
@@ -889,19 +980,16 @@ async def admin_manage_user(call: CallbackQuery):
         text = "🧹 Статистика и ачивки очищены."
         log_audit(call.from_user.id, "Cleared stats", target_id)
         
-    elif action_type == "admrole":
-        conn.execute("UPDATE users SET role = ? WHERE tg_id = ?", (action, target_id))
-        text = f"👔 Роль изменена на {action}."
-        log_audit(call.from_user.id, f"Changed role to {action}", target_id)
-        
     conn.commit()
     conn.close()
     
     await call.answer(text, show_alert=True)
-    await call.message.delete()
+    try:
+        await call.message.delete()
+    except TelegramBadRequest: pass
     await admin_panel_start(call.message)
 
-# ТИКЕТЫ: ПРОСМОТР И ОБРАБОТКА
+# === ТИКЕТЫ (ПРИВЯЗКА И ЖАЛОБЫ) ===
 @router.callback_query(F.data.startswith("admin_tickets_"), IsModOrAdmin())
 async def admin_view_tickets(call: CallbackQuery, state: FSMContext):
     t_type = call.data.split("_")[2]
@@ -935,7 +1023,9 @@ async def admin_ticket_decline(call: CallbackQuery):
     conn.execute("UPDATE tickets SET status='closed' WHERE id=?", (t_id,))
     conn.commit()
     conn.close()
-    await call.message.edit_reply_markup(reply_markup=None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except: pass
     await call.message.reply("❌ Тикет закрыт (отклонен).")
     await call.answer()
 
@@ -954,13 +1044,15 @@ async def admin_ticket_accept(call: CallbackQuery, state: FSMContext):
     conn.commit()
     conn.close()
     
-    await call.message.edit_reply_markup(reply_markup=None)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except: pass
     
     if t_type == 'roblox_bind':
         await call.message.reply("Введите Ник и ID Roblox через пробел\n(Пример: <code>CoolNinja 1234567</code>):")
         await state.set_state(AppStates.admin_waiting_roblox_data)
     else:
-        await call.message.reply("✅ Жалоба помечена как обработанная. Теперь вы можете найти нарушителя через «Управление юзером» и выдать ЧС.")
+        await call.message.reply("✅ Жалоба помечена как обработанная. Вы можете найти нарушителя через «Управление юзером» и выдать ЧС.")
         await state.clear()
         
     await call.answer()
@@ -993,7 +1085,7 @@ async def admin_save_roblox_data(message: Message, state: FSMContext):
 # ==========================================
 @router.callback_query(F.data == "admin_broadcast", IsSuperAdmin())
 async def admin_broadcast_start(call: CallbackQuery, state: FSMContext):
-    await call.message.edit_text("📢 Отправьте текст (с картинкой/видео или без), который нужно разослать ВСЕМ пользователям бота:\n\nДля отмены нажмите кнопку ниже.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_cancel")]]))
+    await call.message.edit_text("📢 Отправьте текст (можно с картинкой/видео), который нужно разослать ВСЕМ пользователям бота:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_cancel")]]))
     await state.set_state(AppStates.admin_waiting_broadcast_msg)
     await call.answer()
 
@@ -1009,7 +1101,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
         try:
             await message.copy_to(chat_id=u['tg_id'])
             success += 1
-            await asyncio.sleep(0.05) # Защита от спам-блока Телеграма
+            await asyncio.sleep(0.05) 
         except: pass
         
     await message.answer(f"✅ Рассылка завершена!\nУспешно доставлено: <b>{success}</b> пользователям.", reply_markup=get_admin_main_kb(True))
@@ -1030,16 +1122,15 @@ async def admin_backup_panel(call: CallbackQuery):
 # ==========================================
 async def auto_backup():
     while True:
-        await asyncio.sleep(3600) # Каждый час (3600 сек)
+        await asyncio.sleep(3600) # Авто-бэкап каждый час (3600 сек)
         try:
             await bot.send_document(ADMIN_ID, FSInputFile(DB_NAME), caption=f"💾 АВТО-БЭКАП БД | {datetime.now().strftime('%H:%M')}")
         except: pass
 
 async def main():
     dp.include_router(router)
-    print("AntiScam Enterprise v2 Успешно запущен!")
+    print("AntiScam Enterprise v3 Успешно запущен!")
     
-    # Запускаем авто-бэкап как фоновую задачу
     asyncio.create_task(auto_backup())
     
     await bot.delete_webhook(drop_pending_updates=True)
