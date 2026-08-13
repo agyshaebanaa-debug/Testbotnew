@@ -83,6 +83,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS room_participants (
             thread_id INTEGER,
@@ -390,7 +391,6 @@ class AppStates(StatesGroup):
     waiting_for_review_text = State()
     waiting_for_check_target = State()
     
-    # Новые стейты для вызова Гаранта
     waiting_for_specific_garant = State()
     waiting_for_garant_details = State()
     
@@ -521,7 +521,7 @@ async def create_receipt(message: Message):
 
 @router.message(F.text == "🤝 Подтвердить сделку", IsPrivate())
 async def p2p_trade_start(message: Message, state: FSMContext):
-    await message.answer("🤝 Введите <b>@username</b> или <b>ID</b> человека, с которым вы успешно провели сделку:", reply_markup=get_cancel_reply_kb())
+    await message.answer("🤝 Введите <b>@username</b> или <b>ID</b> человека, которому хотите подтвердить и засчитать сделку (например, Гаранту):", reply_markup=get_cancel_reply_kb())
     await state.set_state(AppStates.waiting_for_p2p_partner)
 
 @router.message(AppStates.waiting_for_p2p_partner, IsPrivate())
@@ -547,15 +547,15 @@ async def p2p_trade_process(message: Message, state: FSMContext):
     conn.close()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"p2p_accept_{trade_id}")],
+        [InlineKeyboardButton(text="✅ Принять репутацию", callback_data=f"p2p_accept_{trade_id}")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"p2p_decline_{trade_id}")]
     ])
     
     try:
-        await bot.send_message(partner['tg_id'], f"🤝 <b>Новый запрос на сделку!</b>\nПользователь @{message.from_user.username} утверждает, что провел с вами трейд.\nПодтверждаете?", reply_markup=kb)
-        await message.answer("✅ Запрос отправлен партнеру.", reply_markup=get_main_reply_kb(role))
+        await bot.send_message(partner['tg_id'], f"🤝 <b>Новый запрос на подтверждение сделки!</b>\nПользователь @{message.from_user.username} хочет засчитать вам <b>+1 сделку</b> в профиль.\nПринять?", reply_markup=kb)
+        await message.answer("✅ Запрос отправлен. Ожидайте подтверждения от получателя.", reply_markup=get_main_reply_kb(role))
     except:
-        await message.answer("❌ Партнер заблокировал бота.", reply_markup=get_main_reply_kb(role))
+        await message.answer("❌ Партнер заблокировал бота или ни разу его не запускал.", reply_markup=get_main_reply_kb(role))
     
     await state.clear()
 
@@ -567,7 +567,7 @@ async def p2p_accept(call: CallbackQuery):
     
     if not trade or trade[3] != 'pending': 
         conn.close()
-        return await call.answer("❌ Сделка уже обработана.", show_alert=True)
+        return await call.answer("❌ Запрос уже обработан.", show_alert=True)
         
     u1, u2 = trade[1], trade[2]
     conn.close()
@@ -575,17 +575,17 @@ async def p2p_accept(call: CallbackQuery):
     await check_anti_boost(u1, u2)
     
     conn = sqlite3.connect(DB_NAME)
-    conn.execute("UPDATE users SET trades = trades + 1 WHERE tg_id IN (?, ?)", (u1, u2))
+    # Начисляем +1 только тому, КОМУ кинули запрос (партнеру u2)
+    conn.execute("UPDATE users SET trades = trades + 1 WHERE tg_id = ?", (u2,))
     conn.execute("UPDATE trades_p2p SET status = 'accepted' WHERE id = ?", (trade_id,))
     conn.commit()
     conn.close()
     
-    try: await call.message.edit_text("✅ Сделка подтверждена!")
+    try: await call.message.edit_text("✅ Сделка подтверждена! Вам начислена +1 сделка в профиль.")
     except: pass
-    try: await bot.send_message(u1, "🎉 Партнер подтвердил сделку! Вам начислена +1 сделка.")
+    try: await bot.send_message(u1, f"🎉 Пользователь принял ваш запрос! Ему начислена +1 сделка.")
     except: pass
     
-    await check_achievements(u1)
     await check_achievements(u2)
 
 @router.callback_query(F.data.startswith("p2p_decline_"))
@@ -595,7 +595,7 @@ async def p2p_decline(call: CallbackQuery):
     conn.execute("UPDATE trades_p2p SET status = 'declined' WHERE id = ?", (trade_id,))
     conn.commit()
     conn.close()
-    try: await call.message.edit_text("❌ Вы отклонили сделку.")
+    try: await call.message.edit_text("❌ Вы отклонили запрос.")
     except: pass
 
 @router.message(F.text == "⭐ Оставить отзыв", IsPrivate())
@@ -729,7 +729,6 @@ async def call_garant_specific_process(message: Message, state: FSMContext):
 async def call_garant_any_req(call: CallbackQuery, state: FSMContext):
     await state.update_data(target_garant=None)
     await call.message.edit_text("📝 Опишите условия сделки (Что даете вы, что должен дать партнер, сколько людей участвует):")
-    # Нужно отправить reply кнопку отмены
     msg = await call.message.answer("Ожидаю ввод...", reply_markup=get_cancel_reply_kb())
     await state.set_state(AppStates.waiting_for_garant_details)
     await call.answer()
@@ -895,7 +894,11 @@ async def close_trade_room(message: Message):
     
     for uid in users_to_reward:
         conn.execute("UPDATE users SET trades = trades + 1 WHERE tg_id = ?", (uid,))
-        try: await bot.send_message(uid, "✅ Сделка через гаранта успешно завершена! Вам начислена +1 сделка в профиль.")
+        if uid == room['garant_id']:
+            msg_text = "✅ Безопасная комната закрыта! Вам начислена +1 сделка в профиль."
+        else:
+            msg_text = "✅ Сделка через гаранта успешно завершена! Вам начислена +1 сделка в профиль.\n\n⭐️ Желательно оставить отзыв гаранту через кнопку «⭐ Оставить отзыв» в главном меню!"
+        try: await bot.send_message(uid, msg_text)
         except: pass
 
     conn.commit()
