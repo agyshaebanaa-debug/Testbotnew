@@ -19,12 +19,11 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 # ==========================================
 # НАСТРОЙКИ БОТА
 # ==========================================
-BOT_TOKEN = "8849560433:AAGneHz6CP09oIJl-C6sO9iIsYAy2YQtoLE" # <-- Вставь сюда токен
-ADMIN_ID = 5341904332 # <-- Вставь сюда свой Telegram ID
+BOT_TOKEN = "8792564218:AAHo3taU03G4FGAtIovL6mdSNXRA72QrtE0" # <-- Твой токен
+ADMIN_ID = 5341904332 # <-- Твой Telegram ID
 
-# ID Супергруппы (с включенными темами) для Безопасных Комнат.
-# Создай группу, включи "Темы", добавь бота как админа и вставь ID сюда (начинается с -100)
-TRADE_ROOMS_GROUP_ID = 0 
+# ID Супергруппы для Безопасных Комнат.
+TRADE_ROOMS_GROUP_ID = -1003863551255 
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -59,7 +58,6 @@ def init_db():
         )
     ''')
     
-    # Умная миграция: добавление новых колонок (Реф. система, Анти-накрутка и т.д.)
     cursor.execute("PRAGMA table_info(users)")
     columns = [info[1] for info in cursor.fetchall()]
     
@@ -98,7 +96,6 @@ def init_db():
     ''')
     
     # Таблица тикетов (привязки и жалобы)
-    # Добавлена колонка target_id для подсчета Индекса риска
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS tickets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,7 +124,7 @@ def init_db():
         )
     ''')
     
-    # Выдаем права Супер-Админа владельцу при старте
+    # Выдаем права Супер-Админа владельцу
     cursor.execute("SELECT * FROM users WHERE tg_id = ?", (ADMIN_ID,))
     if cursor.fetchone():
         cursor.execute("UPDATE users SET role = 'admin' WHERE tg_id = ?", (ADMIN_ID,))
@@ -150,7 +147,6 @@ def log_audit(staff_id, action, target_id=0):
     conn.commit()
     conn.close()
 
-# Роли: user, garant, junior_mod, senior_mod, admin
 class IsSuperAdmin(BaseFilter):
     async def __call__(self, message: Message) -> bool:
         return message.from_user.id == ADMIN_ID
@@ -194,17 +190,10 @@ ACHIEVEMENTS = {
 
 def calculate_risk_score(user_id: int, is_premium: bool, suspected_boost: bool) -> int:
     score = 10  # Базовый риск 10%
-    
-    # Свежесть аккаунта (косвенно по ID)
     if user_id > 6500000000: score += 15
-    
-    # Премиум дает траст
     if is_premium: score -= 15
-    
-    # Если есть подозрение на накрутку (Anti-Boost)
     if suspected_boost: score += 40
     
-    # Открытые жалобы на юзера
     conn = get_db()
     pending_reports = conn.execute("SELECT COUNT(*) FROM tickets WHERE target_id = ? AND type = 'report' AND status = 'pending'", (user_id,)).fetchone()[0]
     conn.close()
@@ -215,6 +204,32 @@ def calculate_risk_score(user_id: int, is_premium: bool, suspected_boost: bool) 
     if score > 100: return 100
     return score
 
+async def check_anti_boost(u1: int, u2: int):
+    """Теневой детектор накрутки (Сделки и Отзывы)"""
+    conn = get_db()
+    # Считаем сделки за последние 4 часа
+    recent_trades = conn.execute('''
+        SELECT COUNT(*) FROM trades_p2p 
+        WHERE ((initiator_id=? AND partner_id=?) OR (initiator_id=? AND partner_id=?)) 
+        AND status='accepted' AND created_at >= datetime('now', '-4 hours')
+    ''', (u1, u2, u2, u1)).fetchone()[0]
+    
+    # Считаем отзывы за последние 4 часа
+    recent_reviews = conn.execute('''
+        SELECT COUNT(*) FROM reviews
+        WHERE ((reviewer_id=? AND target_id=?) OR (reviewer_id=? AND target_id=?))
+        AND created_at >= datetime('now', '-4 hours')
+    ''', (u1, u2, u2, u1)).fetchone()[0]
+    
+    # Если в сумме уже 4 (текущее действие будет 5-м), вешаем флаг накрутки
+    if (recent_trades + recent_reviews) >= 4: 
+        conn.execute("UPDATE users SET suspected_boost = 1 WHERE tg_id IN (?, ?)", (u1, u2))
+        conn.commit()
+        try:
+            await bot.send_message(ADMIN_ID, f"⚠️ <b>[Anti-Boost] Подозрение на накрутку!</b>\nЮзеры <code>{u1}</code> и <code>{u2}</code> провели 5+ действий (сделки/отзывы) за 4 часа. Флаг выставлен, индекс риска повышен.")
+        except: pass
+    conn.close()
+
 async def check_referral_bonus(user_id):
     conn = get_db()
     user = conn.execute("SELECT referrer_id FROM users WHERE tg_id = ?", (user_id,)).fetchone()
@@ -224,13 +239,13 @@ async def check_referral_bonus(user_id):
         return
         
     referrer_id = user['referrer_id']
-    referrer = conn.execute("SELECT ref_bonus_received, badges, rating_sum, reviews_count FROM users WHERE tg_id = ?", (referrer_id,)).fetchone()
+    referrer = conn.execute("SELECT ref_bonus_received, badges FROM users WHERE tg_id = ?", (referrer_id,)).fetchone()
     
     if not referrer or referrer['ref_bonus_received']:
         conn.close()
         return
         
-    # Проверяем, сколько активных рефералов (Roblox привязан, >= 2 сделок)
+    # Проверяем активных рефералов (Roblox привязан, >= 2 сделок)
     active_refs = conn.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ? AND trades >= 2 AND roblox_id != 'Нет'", (referrer_id,)).fetchone()[0]
     
     if active_refs >= 3:
@@ -240,18 +255,17 @@ async def check_referral_bonus(user_id):
             
         new_badges_str = ",".join(current_badges)
         
-        # Буст рейтинга (симулируем +1 отзыв на 5 звезд и небольшой экстра-вес)
-        conn.execute("UPDATE users SET badges = ?, ref_bonus_received = 1, rating_sum = rating_sum + 5.0, reviews_count = reviews_count + 1 WHERE tg_id = ?", (new_badges_str, referrer_id))
+        # Даем только бейдж (без буста рейтинга, как обсуждали)
+        conn.execute("UPDATE users SET badges = ?, ref_bonus_received = 1 WHERE tg_id = ?", (new_badges_str, referrer_id))
         conn.commit()
         
         try:
             await bot.send_message(
                 referrer_id, 
                 "🕷 <b>СЕТЬ СПЛЕТЕНА!</b> 🕷\n\n"
-                "Трое твоих приглашенных друзей привязали Roblox и сделали сделки.\n"
+                "Трое твоих приглашенных друзей привязали Roblox и провели сделки.\n"
                 "🎁 <b>Награда получена:</b>\n"
-                "• Уникальный титул: <b>Мастер Паутины</b>\n"
-                "• Буст к рейтингу: <b>+5.0 ⭐</b>"
+                "• Уникальный титул: <b>Мастер Паутины</b>"
             )
         except: pass
         
@@ -307,7 +321,7 @@ def get_user_title(trades):
 
 def get_main_reply_kb(user_role):
     builder = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🤝 Создать сделку")],
+        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🤝 Подтвердить сделку")],
         [KeyboardButton(text="⭐ Оставить отзыв"), KeyboardButton(text="🧾 Создать чек")],
         [KeyboardButton(text="🛡 Гаранты"), KeyboardButton(text="⚠️ Скамеры"), KeyboardButton(text="🏆 Топ")],
         [KeyboardButton(text="🔍 Проверить"), KeyboardButton(text="🛎 Вызвать Гаранта")],
@@ -438,7 +452,6 @@ async def show_profile(message: Message):
     badges_display = "\n".join([f"🏅 {ACHIEVEMENTS.get(b, b)}" for b in badges_list if b in ACHIEVEMENTS])
     if not badges_display: badges_display = "<i>Нет достижений</i>"
     
-    # Индекс риска
     is_premium = getattr(message.from_user, 'is_premium', False)
     risk_score = calculate_risk_score(user['tg_id'], is_premium, user['suspected_boost'])
     
@@ -459,7 +472,7 @@ async def show_profile(message: Message):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🎖 <b>Достижения:</b>\n{badges_display}\n\n"
         f"🕸 <b>Реферальная паутина:</b>\n"
-        f"<i>Пригласи 3 друзей (привязка + 2 сделки) и получи статус 'Мастер Паутины' и буст рейтинга.</i>\n"
+        f"<i>Пригласи 3 друзей (привязка + 2 сделки) и получи уникальный статус.</i>\n"
         f"Твоя ссылка: <code>{ref_link}</code>"
     )
     await message.answer(text)
@@ -490,7 +503,7 @@ async def create_receipt(message: Message):
     text += f"\n<i>✅ Верифицировано Global Antiscam Database</i>"
     await message.answer(text)
 
-@router.message(F.text == "🤝 Создать сделку", IsPrivate())
+@router.message(F.text == "🤝 Подтвердить сделку", IsPrivate())
 async def p2p_trade_start(message: Message, state: FSMContext):
     await message.answer("🤝 Введите <b>@username</b> или <b>ID</b> человека, с которым вы успешно провели сделку:", reply_markup=get_cancel_reply_kb())
     await state.set_state(AppStates.waiting_for_p2p_partner)
@@ -543,21 +556,13 @@ async def p2p_accept(call: CallbackQuery):
         return await call.answer("❌ Сделка уже обработана.", show_alert=True)
         
     u1, u2 = trade[1], trade[2]
+    conn.close()
     
-    # ТЕНЕВОЙ ДЕТЕКТОР НАКРУТКИ (Anti-Boost)
-    # Проверяем, сколько сделок было между этими двумя за последние 4 часа
-    recent_trades = conn.execute('''
-        SELECT COUNT(*) FROM trades_p2p 
-        WHERE ((initiator_id=? AND partner_id=?) OR (initiator_id=? AND partner_id=?)) 
-        AND status='accepted' AND created_at >= datetime('now', '-4 hours')
-    ''', (u1, u2, u2, u1)).fetchone()[0]
+    # Теневой детектор накрутки (проверяет сделки и отзывы)
+    await check_anti_boost(u1, u2)
     
-    if recent_trades >= 4: # Это 5-я сделка
-        conn.execute("UPDATE users SET suspected_boost = 1 WHERE tg_id IN (?, ?)", (u1, u2))
-        try:
-            await bot.send_message(ADMIN_ID, f"⚠️ <b>[Anti-Boost] Подозрение на накрутку!</b>\nЮзеры <code>{u1}</code> и <code>{u2}</code> провели 5+ сделок за 4 часа. Флаг выставлен.")
-        except: pass
-
+    # Начисление сделки
+    conn = sqlite3.connect(DB_NAME)
     conn.execute("UPDATE users SET trades = trades + 1 WHERE tg_id IN (?, ?)", (u1, u2))
     conn.execute("UPDATE trades_p2p SET status = 'accepted' WHERE id = ?", (trade_id,))
     conn.commit()
@@ -620,8 +625,11 @@ async def review_stars(message: Message, state: FSMContext):
 @router.message(AppStates.waiting_for_review_text, IsPrivate())
 async def review_text(message: Message, state: FSMContext):
     data = await state.get_data()
-    conn = sqlite3.connect(DB_NAME)
     
+    # Теневой детектор накрутки (проверяет сделки и отзывы)
+    await check_anti_boost(message.from_user.id, data['target_id'])
+    
+    conn = sqlite3.connect(DB_NAME)
     conn.execute("INSERT INTO reviews (reviewer_id, target_id, rating, review_text) VALUES (?, ?, ?, ?)",
                  (message.from_user.id, data['target_id'], data['stars'], message.text))
     conn.execute("UPDATE users SET rating_sum = rating_sum + ?, reviews_count = reviews_count + 1 WHERE tg_id = ?",
@@ -735,7 +743,6 @@ async def garant_take_order(call: CallbackQuery):
     parts = call.data.split("_")
     client_a = int(parts[2])
     client_b = int(parts[3])
-    garant_id = call.from_user.id
     
     if TRADE_ROOMS_GROUP_ID == 0:
         return await call.answer("❌ Админ не настроил TRADE_ROOMS_GROUP_ID. Функция недоступна.", show_alert=True)
@@ -746,8 +753,6 @@ async def garant_take_order(call: CallbackQuery):
             name=f"🤝 Сделка #{client_a}-{client_b}"
         )
         
-        # Генерируем ссылку на топик
-        # Формат: https://t.me/c/{chat_id_without_-100}/{thread_id}
         chat_id_str = str(TRADE_ROOMS_GROUP_ID)[4:]
         topic_url = f"https://t.me/c/{chat_id_str}/{topic.message_thread_id}"
         
@@ -757,7 +762,6 @@ async def garant_take_order(call: CallbackQuery):
         await bot.send_message(client_b, msg)
         await call.message.edit_text(f"✅ Комната создана.\n👉 {topic_url}\n\nВ теме напишите <code>/closeroom</code> по завершению.")
         
-        # Приветствие в самой теме
         await bot.send_message(
             chat_id=TRADE_ROOMS_GROUP_ID,
             message_thread_id=topic.message_thread_id,
@@ -771,11 +775,9 @@ async def garant_take_order(call: CallbackQuery):
 
 @router.message(Command("closeroom"))
 async def close_trade_room(message: Message):
-    # Работает только в супергруппе-комнате
     if message.chat.id != TRADE_ROOMS_GROUP_ID or not message.is_topic_message:
         return
         
-    # Проверка, что закрывает гарант или админ
     conn = get_db()
     role_data = conn.execute("SELECT role, status FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
     conn.close()
@@ -875,7 +877,6 @@ async def send_check_result(message: Message, target: str, state: FSMContext = N
     
     conn.close()
     
-    # Расчет индекса риска, симулируя премиум для неизвестного статуса
     risk_score = calculate_risk_score(user['tg_id'], False, user['suspected_boost'])
     risk_emoji = "🟢" if risk_score < 30 else "🟡" if risk_score < 70 else "🔴"
     
@@ -1074,7 +1075,7 @@ async def admin_save_roblox_data(message: Message, state: FSMContext):
         
         conn = get_db()
         
-        # ТРЕКЕР ОТВЯЗАННЫХ АККАУНТОВ (Blacklist Tracker)
+        # Трекер отвязанных аккаунтов (Blacklist Tracker)
         blacklist_check = conn.execute("SELECT tg_id, status FROM users WHERE (roblox_username = ? OR roblox_id = ?) AND status = 'scammer'", (rbx_nick, rbx_id)).fetchone()
         
         if blacklist_check:
@@ -1205,18 +1206,15 @@ async def admin_upload_db_process(message: Message, state: FSMContext):
         
     await message.answer("⏳ Скачивание и замена БД...")
     
-    # Сохраняем как временный файл, затем подменяем
     temp_file = "temp_db_upload.db"
     file = await bot.get_file(message.document.file_id)
     await bot.download_file(file.file_path, temp_file)
     
     try:
-        # Проверяем целостность скачанной БД
         test_conn = sqlite3.connect(temp_file)
         test_conn.execute("SELECT 1 FROM users LIMIT 1")
         test_conn.close()
         
-        # Подменяем боевую БД
         os.replace(temp_file, DB_NAME)
         await message.answer("✅ База данных успешно обновлена! Изменения вступили в силу.", reply_markup=get_admin_main_kb('admin'))
         
