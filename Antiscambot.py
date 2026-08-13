@@ -19,7 +19,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 # ==========================================
 # НАСТРОЙКИ БОТА
 # ==========================================
-BOT_TOKEN = "8792564218:AAHo3taU03G4FGAtIovL6mdSNXRA72QrtE0" # <-- Твой токен
+BOT_TOKEN = "8849560433:AAGneHz6CP09oIJl-C6sO9iIsYAy2YQtoLE" # <-- Твой токен
 ADMIN_ID = 5341904332 # <-- Твой Telegram ID
 
 # ID Супергруппы для Безопасных Комнат.
