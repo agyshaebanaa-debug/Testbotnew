@@ -1,12 +1,16 @@
 import sys
 import subprocess
 
-# Автоустановка недостающих библиотек при старте
-for package in ["Pillow", "aiohttp", "aiogram"]:
+# Автоустановка недостающих библиотек при старте (Вариант 1)
+for package in ["Pillow", "aiohttp", "qrcode", "aiogram"]:
     try:
-        __import__(package if package != "Pillow" else "PIL")
+        if package == "Pillow":
+            __import__("PIL")
+        else:
+            __import__(package)
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
 import asyncio
 import sqlite3
 import os
@@ -16,8 +20,9 @@ import random
 import string
 from datetime import datetime, timedelta
 import aiohttp
+import qrcode
 
-# Pillow for Passport Graphic Generation
+# Pillow for Passport 2.0 Graphic Generation
 from PIL import Image, ImageDraw, ImageFont
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -27,15 +32,13 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, 
     InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, ChatPermissions,
-    ForumTopic, BufferedInputFile
+    ForumTopic, BufferedInputFile, InlineQuery, InlineQueryResultArticle, 
+    InputTextMessageContent
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
-# ==========================================
-# НАСТРОЙКИ БОТА
-# ==========================================
 BOT_TOKEN = "8849560433:AAGneHz6CP09oIJl-C6sO9iIsYAy2YQtoLE" # <-- Твой токен
 ADMIN_ID = 5341904332 # <-- Твой Telegram ID
 TRADE_ROOMS_GROUP_ID = -1003863551255 # ID Супергруппы для Безопасных Комнат
@@ -46,9 +49,6 @@ dp = Dispatcher()
 router = Router()
 DB_NAME = "antiscam_pro.db"
 
-# ==========================================
-# БАЗА ДАННЫХ И УМНЫЕ МИГРАЦИИ
-# ==========================================
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -177,9 +177,6 @@ def log_audit(staff_id, action, target_id=0):
     conn.commit()
     conn.close()
 
-# ==========================================
-# ФИЛЬТРЫ И ДОСТИЖЕНИЯ
-# ==========================================
 class IsSuperAdmin(BaseFilter):
     async def __call__(self, message: Message) -> bool:
         return message.from_user.id == ADMIN_ID
@@ -222,9 +219,6 @@ ACHIEVEMENTS = {
     "roblox_bound": "🎮 Верифицирован Roblox"
 }
 
-# ==========================================
-# ROBLOX PUBLIC API INTEGRATION
-# ==========================================
 async def get_roblox_user(username: str):
     """Получает Roblox ID по никнейму через официальный API"""
     url = "https://users.roblox.com/v1/usernames/users"
@@ -235,7 +229,7 @@ async def get_roblox_user(username: str):
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("data") and len(data["data"]) > 0:
-                        return data["data"][0] # {"id": ..., "name": ...}
+                        return data["data"][0]
     except Exception as e:
         print(f"Roblox API Error: {e}")
     return None
@@ -253,14 +247,28 @@ async def get_roblox_bio(roblox_id: int) -> str:
         print(f"Roblox Bio API Error: {e}")
     return ""
 
-# ==========================================
-# ДИНАМИЧЕСКИЙ ИНДЕКС РИСКА И АНТИ-БУСТ
-# ==========================================
+async def get_roblox_avatar_headshot(roblox_id: str) -> io.BytesIO | None:
+    """Получает 3D аватарку (Headshot) игрока Roblox"""
+    if not roblox_id or roblox_id == 'Нет' or not str(roblox_id).isdigit():
+        return None
+    url = f"https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={roblox_id}&size=150x150&format=Png&isCircular=false"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("data") and len(data["data"]) > 0:
+                        img_url = data["data"][0].get("imageUrl")
+                        if img_url:
+                            async with session.get(img_url, timeout=5) as img_resp:
+                                if img_resp.status == 200:
+                                    img_bytes = await img_resp.read()
+                                    return io.BytesIO(img_bytes)
+    except Exception as e:
+        print(f"Roblox Headshot API Error: {e}")
+    return None
+
 def calculate_risk_score(user_id: int, is_premium: bool, suspected_boost: bool) -> int:
-    """
-    Динамический расчёт риска (0-100%):
-    Учитывает: ID возраст, привязку Roblox, сделки, рейтинг, флаг накрутки и жалобы.
-    """
     conn = get_db()
     user = conn.execute("SELECT trades, rating_sum, reviews_count, roblox_id, status FROM users WHERE tg_id = ?", (user_id,)).fetchone()
     
@@ -272,45 +280,32 @@ def calculate_risk_score(user_id: int, is_premium: bool, suspected_boost: bool) 
         conn.close()
         return 100
 
-    score = 15 # Базовый риск
-    
-    # Telegram ID проверка (свежесть)
+    score = 15
     if user_id > 6500000000: score += 15
     if is_premium: score -= 15
     
-    # Привязка Roblox
-    if user['roblox_id'] == 'Нет':
-        score += 20
-    else:
-        score -= 10
+    if user['roblox_id'] == 'Нет': score += 20
+    else: score -= 10
 
-    # Опыт сделок
     trades = user['trades']
     if trades == 0: score += 10
     elif trades >= 5: score -= 10
     elif trades >= 20: score -= 25
 
-    # Средний рейтинг
     if user['reviews_count'] > 0:
         avg_rating = user['rating_sum'] / user['reviews_count']
         if avg_rating < 4.0: score += 30
         elif avg_rating >= 4.8: score -= 15
 
-    # Флаг накрутки
     if suspected_boost: score += 40
 
-    # Активные жалобы
     pending_reports = conn.execute("SELECT COUNT(*) FROM tickets WHERE target_id = ? AND type = 'report' AND status = 'pending'", (user_id,)).fetchone()[0]
     score += (pending_reports * 25)
 
     conn.close()
-
-    if score < 0: return 0
-    if score > 100: return 100
-    return score
+    return max(0, min(100, score))
 
 async def check_anti_boost(u1: int, u2: int):
-    """Детектор накрутки (Сделки и Отзывы)"""
     conn = get_db()
     recent_trades = conn.execute('''
         SELECT COUNT(*) FROM trades_p2p 
@@ -328,27 +323,24 @@ async def check_anti_boost(u1: int, u2: int):
         conn.execute("UPDATE users SET suspected_boost = 1 WHERE tg_id IN (?, ?)", (u1, u2))
         conn.commit()
         try:
-            await bot.send_message(ADMIN_ID, f"⚠️ <b>[Anti-Boost] Подозрение на накрутку!</b>\nЮзеры <code>{u1}</code> и <code>{u2}</code> провели 4+ совместных действия за 4 часа. Флаг выставлен.")
+            await bot.send_message(ADMIN_ID, f"⚠️ <b>[Anti-Boost] Подозрение на накрутку!</b>\nЮзеры <code>{u1}</code> и <code>{u2}</code> провели 4+ совместных действия за 4 часа.")
         except: pass
     conn.close()
 
 async def check_referral_bonus(user_id):
     conn = get_db()
     user = conn.execute("SELECT referrer_id FROM users WHERE tg_id = ?", (user_id,)).fetchone()
-    
     if not user or user['referrer_id'] == 0:
         conn.close()
         return
         
     referrer_id = user['referrer_id']
     referrer = conn.execute("SELECT ref_bonus_received, badges FROM users WHERE tg_id = ?", (referrer_id,)).fetchone()
-    
     if not referrer or referrer['ref_bonus_received']:
         conn.close()
         return
         
     active_refs = conn.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ? AND roblox_id != 'Нет'", (referrer_id,)).fetchone()[0]
-    
     if active_refs >= 3:
         current_badges = referrer['badges'].split(',') if referrer['badges'] else []
         if "web_master" not in current_badges:
@@ -357,13 +349,10 @@ async def check_referral_bonus(user_id):
         new_badges_str = ",".join(current_badges)
         conn.execute("UPDATE users SET badges = ?, ref_bonus_received = 1 WHERE tg_id = ?", (new_badges_str, referrer_id))
         conn.commit()
-        
         try:
             await bot.send_message(
                 referrer_id, 
-                "🕷 <b>СЕТЬ СПЛЕТЕНА!</b> 🕷\n\n"
-                "Трое твоих приглашенных друзей верифицировали Roblox!\n"
-                "🎁 <b>Титул получен:</b> <b>Мастер Паутины</b>"
+                "🕷 <b>СЕТЬ СПЛЕТЕНА!</b>\nТрое ваших друзей верифицировали Roblox!\n🎁 Получен титул: <b>Мастер Паутины</b>"
             )
         except: pass
     conn.close()
@@ -403,72 +392,105 @@ async def check_achievements(user_id):
     conn.close()
     await check_referral_bonus(user_id)
 
-# ==========================================
-# ГЕНЕРАТОР ГРАФИЧЕСКИХ ПАСПОРТОВ (PILLOW)
-# ==========================================
-def generate_passport_image(user_data: dict, risk_score: int) -> io.BytesIO:
-    """Генерирует стильную графическую карточку трейдера (PNG)"""
-    width, height = 750, 420
-    img = Image.new("RGBA", (width, height), "#111827")
+def clean_text_for_pillow(text: str) -> str:
+    """Очищает текст от символов, вызывающих пустоты (tofu)"""
+    return ''.join(c for c in text if ord(c) < 128 or (0x0400 <= ord(c) <= 0x04FF))
+
+def generate_qr_image(data_str: str) -> Image.Image:
+    """Генерирует чистый QR-код без сторонних зависимостей шрифтов"""
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=4,
+        border=1,
+    )
+    qr.add_data(data_str)
+    qr.make(fit=True)
+    return qr.make_image(fill_color="#3B82F6", back_color="#1E293B").convert("RGBA")
+
+def generate_passport_image_2(user_data: dict, risk_score: int, avatar_bytes: io.BytesIO | None, bot_username: str) -> io.BytesIO:
+    """Паспорт 2.0: Без квадратиков, с 3D аватаркой Roblox и QR валидацией"""
+    width, height = 800, 480
+    img = Image.new("RGBA", (width, height), "#0F172A")
     draw = ImageDraw.Draw(img)
 
-    # Задний фон / Рамка
-    draw.rounded_rectangle([15, 15, width - 15, height - 15], radius=20, fill="#1F2937", outline="#374151", width=3)
+    # Основная плашка карточки
+    draw.rounded_rectangle([20, 20, width - 20, height - 20], radius=24, fill="#1E293B", outline="#334155", width=3)
     
     # Шапка
-    draw.rectangle([15, 15, width - 15, 75], fill="#111827")
-    draw.text((35, 30), "ГАД // GLOBAL ANTISCAM DATABASE", fill="#3B82F6")
-    draw.text((width - 220, 30), "OFFICIAL PASSPORT", fill="#9CA3AF")
+    draw.rectangle([20, 20, width - 20, 80], fill="#090D16")
+    draw.text((40, 35), "GAD // GLOBAL ANTISCAM DATABASE", fill="#3B82F6")
+    draw.text((width - 240, 35), "OFFICIAL PASSPORT 2.0", fill="#64748B")
 
-    # Переменные информации
-    username = f"@{user_data['username']}"
-    tg_id = f"ID: {user_data['tg_id']}"
-    roblox = f"Roblox: {user_data['roblox_username']}"
-    status = f"Status: {user_data['status'].upper()}"
-    trades = f"Trades: {user_data['trades']}"
+    # 1. Загрузка/Отрисовка 3D-Аватарки Roblox
+    avatar_x, avatar_y = 45, 110
+    avatar_size = 130
+    draw.rounded_rectangle([avatar_x, avatar_y, avatar_x + avatar_size, avatar_y + avatar_size], radius=16, fill="#0F172A", outline="#3B82F6", width=2)
+    
+    if avatar_bytes:
+        try:
+            rbx_avatar = Image.open(avatar_bytes).convert("RGBA").resize((avatar_size - 8, avatar_size - 8))
+            img.paste(rbx_avatar, (avatar_x + 4, avatar_y + 4), rbx_avatar)
+        except Exception:
+            draw.text((avatar_x + 25, avatar_y + 55), "NO AVATAR", fill="#64748B")
+    else:
+        draw.text((avatar_x + 25, avatar_y + 55), "NO ROBLOX", fill="#64748B")
+
+    # 2. Текстовые данные
+    clean_uname = clean_text_for_pillow(user_data['username']) or f"User_{user_data['tg_id']}"
+    username_str = f"@{clean_uname}"
+    tg_id_str = f"TG ID: {user_data['tg_id']}"
+    roblox_str = f"Roblox: {user_data['roblox_username']}"
+    status_str = f"Status: {user_data['status'].upper()}"
+    trades_str = f"Trades Completed: {user_data['trades']}"
     
     reviews = user_data['reviews_count']
     rating_avg = (user_data['rating_sum'] / reviews) if reviews > 0 else 0.0
-    rating_str = f"Rating: {rating_avg:.1f} ★ ({reviews} rev.)"
+    rating_str = f"Rating: {rating_avg:.1f} / 5.0 ({reviews} rev.)"
 
-    # Рисуем текст
-    draw.text((40, 105), username, fill="#FFFFFF")
-    draw.text((40, 135), tg_id, fill="#9CA3AF")
-    draw.text((40, 175), roblox, fill="#60A5FA")
-    draw.text((40, 210), status, fill="#10B981" if user_data['status'] == 'user' else "#F59E0B")
-    draw.text((40, 245), trades, fill="#FFFFFF")
-    draw.text((40, 280), rating_str, fill="#FBBF24")
+    text_x = 200
+    draw.text((text_x, 110), username_str, fill="#F8FAFC")
+    draw.text((text_x, 140), tg_id_str, fill="#94A3B8")
+    draw.text((text_x, 175), roblox_str, fill="#60A5FA")
+    draw.text((text_x, 205), status_str, fill="#10B981" if user_data['status'] == 'user' else "#F59E0B")
+    draw.text((text_x, 235), trades_str, fill="#F8FAFC")
+    draw.text((text_x, 265), rating_str, fill="#FBBF24")
 
-    # Рисуем плашку Индекса Риска
-    risk_color = "#10B981" if risk_score < 30 else "#F59E0B" if risk_score < 70 else "#EF4444"
-    draw.rounded_rectangle([width - 250, 110, width - 40, 180], radius=15, fill=risk_color)
-    draw.text((width - 230, 125), "RISK SCORE", fill="#FFFFFF")
-    draw.text((width - 210, 145), f"{risk_score}%", fill="#FFFFFF")
+    # 3. Шкала прогресса ранга
+    trades = user_data['trades']
+    progress = min(100, (trades % 10) * 10 if trades < 100 else 100)
+    draw.text((text_x, 305), f"Rank Progress: {progress}%", fill="#94A3B8")
+    draw.rounded_rectangle([text_x, 330, text_x + 250, 342], radius=6, fill="#0F172A")
+    if progress > 0:
+        fill_w = int((250 * progress) / 100)
+        draw.rounded_rectangle([text_x, 330, text_x + fill_w, 342], radius=6, fill="#3B82F6")
 
-    # Достижения
-    badges_list = user_data['badges'].split(',') if user_data['badges'] else []
-    badges_count = len([b for b in badges_list if b])
-    draw.text((width - 250, 210), f"Badges Unlocked: {badges_count}", fill="#9CA3AF")
+    # 4. Шкала Риска (Risk Score Badge)
+    risk_color = "#22C55E" if risk_score < 30 else "#EAB308" if risk_score < 70 else "#EF4444"
+    draw.rounded_rectangle([width - 240, 110, width - 40, 190], radius=16, fill=risk_color)
+    draw.text((width - 215, 128), "RISK SCORE", fill="#FFFFFF")
+    draw.text((width - 200, 150), f"{risk_score}%", fill="#FFFFFF")
 
-    # Футер
-    draw.line([(35, 350), (width - 35, 350)], fill="#374151", width=2)
-    draw.text((40, 368), f"Verified via GAD Enterprise • Join {OFFICIAL_CHAT}", fill="#6B7280")
+    # 5. QR-код верификации
+    verify_url = f"https://t.me/{bot_username}?start=check_{user_data['tg_id']}"
+    qr_img = generate_qr_image(verify_url).resize((110, 110))
+    img.paste(qr_img, (width - 160, 280))
+    draw.text((width - 165, 400), "SCAN TO VERIFY", fill="#64748B")
 
-    # Сохраняем в буфер памяти
+    # 6. Футер
+    draw.line([(40, 425), (width - 40, 425)], fill="#334155", width=2)
+    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+    draw.text((40, 440), f"Verified via GAD Enterprise • {timestamp_str} • Join {OFFICIAL_CHAT}", fill="#64748B")
+
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     buffer.seek(0)
     return buffer
 
-# ==========================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И КЛАВИАТУРЫ
-# ==========================================
 def format_rating(rating_sum, reviews_count):
-    if reviews_count == 0: return "Нет оценок 🤷‍♂️"
+    if reviews_count == 0: return "Нет оценок"
     avg = rating_sum / reviews_count
-    stars_count = round(avg)
-    stars = "⭐" * stars_count + "🌑" * (5 - stars_count)
-    return f"{avg:.1f} {stars} ({reviews_count} отз.)"
+    return f"{avg:.1f} / 5.0 ({reviews_count} отз.)"
 
 def get_user_title(trades):
     if trades < 5: return "🌱 Новичок"
@@ -529,9 +551,6 @@ def get_admin_user_manage_kb(target_id, current_status, is_hidden, is_boosted):
     buttons.append([InlineKeyboardButton(text="◀️ Назад в Админку", callback_data="admin_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# ==========================================
-# МАШИНА СОСТОЯНИЙ (FSM)
-# ==========================================
 class AppStates(StatesGroup):
     waiting_for_p2p_partner = State()
     waiting_for_review_target = State()
@@ -554,20 +573,24 @@ class AppStates(StatesGroup):
     admin_waiting_rem_mod = State()
     admin_waiting_db_upload = State()
 
-# ==========================================
-# ОСНОВНЫЕ ОБРАБОТЧИКИ
-# ==========================================
 @router.message(CommandStart(), IsPrivate())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     args = message.text.split()
     referrer_id = 0
     
-    if len(args) > 1 and args[1].startswith('ref_'):
-        try:
-            referrer_id = int(args[1].split('_')[1])
-            if referrer_id == message.from_user.id: referrer_id = 0
-        except: pass
+    if len(args) > 1:
+        param = args[1]
+        if param.startswith('ref_'):
+            try:
+                referrer_id = int(param.split('_')[1])
+                if referrer_id == message.from_user.id: referrer_id = 0
+            except: pass
+        elif param.startswith('check_'):
+            try:
+                target_id = param.split('_')[1]
+                return await send_check_result(message, target_id)
+            except: pass
 
     conn = get_db()
     user = conn.execute("SELECT * FROM users WHERE tg_id = ?", (message.from_user.id,)).fetchone()
@@ -585,8 +608,8 @@ async def cmd_start(message: Message, state: FSMContext):
     
     await message.answer(
         f"👋 Добро пожаловать, <b>{message.from_user.first_name}</b>!\n\n"
-        f"🛡 <b>ГАД (Global Antiscam Database)</b> — официальная база данных репутации и система безопасных сделок.\n\n"
-        f"💬 Чат для обмена и поиска трейдеров: {OFFICIAL_CHAT}\n\n"
+        f"🛡 <b>ГАД (Global Antiscam Database)</b> — база данных репутации и система безопасных сделок.\n\n"
+        f"💬 Наш чат для сделок: {OFFICIAL_CHAT}\n\n"
         f"Используйте меню ниже 👇",
         reply_markup=get_main_reply_kb(role)
     )
@@ -625,8 +648,8 @@ async def show_profile(message: Message):
         risk_score = calculate_risk_score(user['tg_id'], is_premium, user['suspected_boost'])
         
         risk_emoji = "🟢" if risk_score < 30 else "🟡" if risk_score < 70 else "🔴"
-        
-        ref_link = f"https://t.me/{(await bot.get_me()).username}?start=ref_{user['tg_id']}"
+        bot_info = await bot.get_me()
+        ref_link = f"https://t.me/{bot_info.username}?start=ref_{user['tg_id']}"
         hidden_status = "\n👻 <i>Теневой профиль (скрыт из топов)</i>" if user['is_hidden'] else ""
 
         text = (
@@ -660,20 +683,19 @@ async def create_receipt_passport(message: Message):
         is_premium = getattr(message.from_user, 'is_premium', False)
         risk_score = calculate_risk_score(user['tg_id'], is_premium, user['suspected_boost'])
         
-        # Генерируем PNG изображение в памяти
-        img_buffer = generate_passport_image(dict(user), risk_score)
-        input_file = BufferedInputFile(img_buffer.getvalue(), filename="passport.png")
+        bot_info = await bot.get_me()
+        avatar_bytes = await get_roblox_avatar_headshot(user['roblox_id'])
+        
+        img_buffer = generate_passport_image_2(dict(user), risk_score, avatar_bytes, bot_info.username)
+        input_file = BufferedInputFile(img_buffer.getvalue(), filename="passport_2.png")
         
         await message.answer_photo(
             photo=input_file,
-            caption=f"🧾 <b>Официальный Паспорт Трейдера ГАД</b>\nПользователь: @{user['username']}\nПроверить актуальность: /check {user['tg_id']}\n💬 Наш чат: {OFFICIAL_CHAT}"
+            caption=f"🧾 <b>Паспорт Трейдера ГАД 2.0</b>\nПользователь: @{user['username']}\nПроверить актуальность: /check {user['tg_id']}\n💬 Наш чат: {OFFICIAL_CHAT}"
         )
     except Exception as e:
         await message.answer(f"❌ Ошибка генерации паспорта: {e}")
 
-# ==========================================
-# АВТО-ПРИВЯЗКА ROBLOX ЧЕРЕЗ API
-# ==========================================
 @router.message(F.text == "🎮 Привязать Roblox", IsPrivate())
 async def bind_roblox_start(message: Message, state: FSMContext):
     await state.clear()
@@ -699,7 +721,6 @@ async def bind_roblox_username(message: Message, state: FSMContext):
     rbx_id = rbx_data["id"]
     rbx_name = rbx_data["name"]
 
-    # Проверка на ЧС
     conn = get_db()
     scammer_check = conn.execute("SELECT tg_id FROM users WHERE roblox_id = ? AND status = 'scammer'", (str(rbx_id),)).fetchone()
     if scammer_check:
@@ -707,10 +728,9 @@ async def bind_roblox_username(message: Message, state: FSMContext):
         conn.commit()
         conn.close()
         await state.clear()
-        return await message.answer("🚨 <b>ОБНАРУЖЕН БАН В СИСТЕМЕ!</b>\nЭтот Roblox аккаунт ранее был забанен за скам. Ваш Telegram аккаунт автоматически заблокирован.")
+        return await message.answer("🚨 <b>ОБНАРУЖЕН БАН В СИСТЕМЕ!</b>\nЭтот Roblox аккаунт забанен за скам. Ваш Telegram заблокирован.")
     conn.close()
 
-    # Генерация проверочного кода
     verify_code = "GAD-" + ''.join(random.choices(string.digits, k=4))
     await state.update_data(rbx_id=rbx_id, rbx_name=rbx_name, verify_code=verify_code)
 
@@ -725,7 +745,7 @@ async def bind_roblox_username(message: Message, state: FSMContext):
         f"1. Зайдите в настройки профиля Roblox (раздел <b>About / О себе</b>).\n"
         f"2. Вставьте туда код: <code>{verify_code}</code>\n"
         f"3. Нажмите кнопку <b>«Я обновил описание»</b> ниже.\n\n"
-        f"<i>После проверки код можно будет сразу удалить из профиля.</i>"
+        f"<i>После проверки код можно сразу удалить из профиля.</i>"
     )
     await message.answer(text, reply_markup=kb)
     await state.set_state(AppStates.waiting_for_roblox_verify)
@@ -766,15 +786,12 @@ async def roblox_check_bio_callback(call: CallbackQuery, state: FSMContext):
             reply_markup=get_main_reply_kb(role)
         )
     else:
-        await call.message.answer(f"❌ Код <code>{verify_code}</code> не найден в вашем описании. Убедитесь, что сохранили изменения в Roblox, и нажмите кнопку еще раз.")
+        await call.message.answer(f"❌ Код <code>{verify_code}</code> не найден в описании. Убедитесь, что сохранили изменения в Roblox.")
 
-# ==========================================
-# P2P СДЕЛКИ И ОТЗЫВЫ
-# ==========================================
 @router.message(F.text == "🤝 Подтвердить сделку", IsPrivate())
 async def p2p_trade_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("🤝 Введите <b>@username</b> или <b>ID</b> человека, которому хотите подтвердить и засчитать сделку (например, Гаранту):", reply_markup=get_cancel_reply_kb())
+    await message.answer("🤝 Введите <b>@username</b> или <b>ID</b> человека, которому хотите подтвердить сделку:", reply_markup=get_cancel_reply_kb())
     await state.set_state(AppStates.waiting_for_p2p_partner)
 
 @router.message(AppStates.waiting_for_p2p_partner, IsPrivate())
@@ -813,12 +830,12 @@ async def p2p_trade_process(message: Message, state: FSMContext):
         ])
         
         try:
-            await bot.send_message(partner['tg_id'], f"🤝 <b>Новый запрос на подтверждение сделки!</b>\nПользователь @{message.from_user.username} хочет засчитать вам <b>+1 сделку</b> в профиль.\nПринять?", reply_markup=kb)
-            await message.answer("✅ Запрос отправлен. Ожидайте подтверждения от получателя.", reply_markup=get_main_reply_kb(role))
+            await bot.send_message(partner['tg_id'], f"🤝 <b>Запрос на сделку!</b>\nПользователь @{message.from_user.username} подтверждает вам +1 сделку. Принять?", reply_markup=kb)
+            await message.answer("✅ Запрос отправлен. Ожидайте подтверждения.", reply_markup=get_main_reply_kb(role))
         except:
-            await message.answer("❌ Партнер заблокировал бота или ни разу его не запускал.", reply_markup=get_main_reply_kb(role))
+            await message.answer("❌ Партнер заблокировал бота.", reply_markup=get_main_reply_kb(role))
     except Exception as e:
-        await message.answer(f"❌ Ошибка процесса: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
     finally:
         await state.clear()
 
@@ -843,9 +860,9 @@ async def p2p_accept(call: CallbackQuery):
     conn.commit()
     conn.close()
     
-    try: await call.message.edit_text("✅ Сделка подтверждена! Вам начислена +1 сделка в профиль.")
+    try: await call.message.edit_text("✅ Сделка подтверждена! Вам начислена +1 сделка.")
     except: pass
-    try: await bot.send_message(u1, f"🎉 Пользователь принял ваш запрос! Ему начислена +1 сделка.")
+    try: await bot.send_message(u1, f"🎉 Пользователь принял ваш запрос!")
     except: pass
     
     await check_achievements(u2)
@@ -905,7 +922,7 @@ async def review_stars(message: Message, state: FSMContext):
         conn.close()
         return await message.answer("Отменено.", reply_markup=get_main_reply_kb(role))
 
-    if "⭐" not in message.text: return await message.answer("Пожалуйста, используйте кнопки ниже.")
+    if "⭐" not in message.text: return await message.answer("Используйте кнопки ниже.")
     stars = int(message.text.split()[0])
     await state.update_data(stars=stars)
     await message.answer("Короткий комментарий (или '-'):", reply_markup=get_cancel_reply_kb())
@@ -944,9 +961,6 @@ async def review_text(message: Message, state: FSMContext):
     finally:
         await state.clear()
 
-# ==========================================
-# БЕЗОПАСНЫЕ КОМНАТЫ И ГАРАНТЫ
-# ==========================================
 @router.message(F.text == "🛡 Гаранты", IsPrivate())
 async def show_garants(message: Message):
     conn = get_db()
@@ -958,7 +972,7 @@ async def show_garants(message: Message):
     text = "🛡 <b>Топ Гарантов ГАД:</b>\n\n"
     for i, g in enumerate(garants, 1):
         text += f"{i}. <b>@{g['username']}</b> | Сделок: {g['trades']} | {format_rating(g['rating_sum'], g['reviews_count'])}\n"
-    text += f"\n💬 Поиск партнера и общение: {OFFICIAL_CHAT}"
+    text += f"\n💬 Общение и поиск сделок: {OFFICIAL_CHAT}"
     await message.answer(text)
 
 @router.message(F.text == "⚠️ Скамеры", IsPrivate())
@@ -997,7 +1011,7 @@ async def call_garant_start(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "call_garant_specific")
 async def call_garant_specific_req(call: CallbackQuery, state: FSMContext):
-    await call.message.edit_text("🎯 Введите <b>@username</b> или <b>ID</b> нужного Гаранта:")
+    await call.message.edit_text("🎯 Введите <b>@username</b> или <b>ID</b> Гаранта:")
     await state.set_state(AppStates.waiting_for_specific_garant)
     await call.answer()
 
@@ -1013,7 +1027,7 @@ async def call_garant_specific_process(message: Message, state: FSMContext):
         return await message.answer("❌ Гарант не найден.")
         
     await state.update_data(target_garant=garant['tg_id'])
-    await message.answer("📝 Теперь опишите условия сделки:", reply_markup=get_cancel_reply_kb())
+    await message.answer("📝 Опишите условия сделки:", reply_markup=get_cancel_reply_kb())
     await state.set_state(AppStates.waiting_for_garant_details)
 
 @router.callback_query(F.data == "call_garant_any")
@@ -1051,7 +1065,7 @@ async def call_garant_process(message: Message, state: FSMContext):
         return await state.clear()
         
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Взять заказ (Создать комнату)", callback_data=f"take_order_{message.from_user.id}")]
+        [InlineKeyboardButton(text="⚡ Взять заказ", callback_data=f"take_order_{message.from_user.id}")]
     ])
         
     notified = 0
@@ -1065,7 +1079,7 @@ async def call_garant_process(message: Message, state: FSMContext):
             notified += 1
         except: pass
         
-    target_text = "выбранному гаранту" if target_garant_id else f"{notified} гарантам"
+    target_text = "гаранту" if target_garant_id else f"{notified} гарантам"
     await message.answer(f"✅ Заявка отправлена {target_text}! Ожидайте создания Безопасной Комнаты.", reply_markup=get_main_reply_kb(role))
     await state.clear()
 
@@ -1088,18 +1102,18 @@ async def garant_take_order(call: CallbackQuery):
         conn.commit()
         conn.close()
         
-        msg = f"🛡 <b>БЕЗОПАСНАЯ КОМНАТА СОЗДАНА</b> 🛡\n\nГарант @{call.from_user.username} взял вашу сделку.\nПерейдите в комнату:\n👉 {topic_url}"
+        msg = f"🛡 <b>БЕЗОПАСНАЯ КОМНАТА СОЗДАНА</b>\nГарант @{call.from_user.username} взял сделку.\n👉 {topic_url}"
         await bot.send_message(client_a, msg)
         
         try:
             await call.message.edit_reply_markup(reply_markup=None)
-            await call.message.reply(f"✅ Комната создана.\n👉 {topic_url}\n\nНапишите <code>/add @username</code> в ветке для добавления людей.\nЗавершение: <code>/closeroom</code>.")
+            await call.message.reply(f"✅ Комната создана.\n👉 {topic_url}")
         except: pass
         
         await bot.send_message(
             chat_id=TRADE_ROOMS_GROUP_ID,
             message_thread_id=topic.message_thread_id,
-            text=f"⚖️ <b>Сделка начата</b>\nГарант: {call.from_user.mention_html()}\n\n<i>Гарант может добавлять участников командой /add @username\nПосторонние сообщения автоматически удаляются!</i>"
+            text=f"⚖️ <b>Сделка начата</b>\nГарант: {call.from_user.mention_html()}\n\n<i>Добавление участников: /add @username\nЗакрытие: /closeroom</i>"
         )
         
     except Exception as e:
@@ -1145,7 +1159,7 @@ async def add_user_to_room(message: Message):
         await bot.send_message(new_user['tg_id'], f"🛡 <b>ПРИГЛАШЕНИЕ В СДЕЛКУ</b>\nГарант добавил вас в комнату:\n👉 {topic_url}")
         await message.reply(f"✅ Пользователь @{new_user['username']} добавлен.")
     except:
-        await message.reply(f"✅ Пользователь добавлен, но его ЛС закрыты. Передайте ссылку: {topic_url}")
+        await message.reply(f"✅ Пользователь добавлен. Передайте ссылку: {topic_url}")
 
 @router.message(Command("closeroom"))
 async def close_trade_room(message: Message):
@@ -1157,9 +1171,8 @@ async def close_trade_room(message: Message):
     
     if not room or room['garant_id'] != message.from_user.id:
         conn.close()
-        return await message.reply("❌ Только Гарант этой сделки может закрыть комнату.")
+        return await message.reply("❌ Только Гарант сделки может закрыть комнату.")
 
-    # При закрытии комнаты +1 сделка намертво зачисляется ТОЛЬКО ГАРАНТУ
     garant_id = room['garant_id']
     conn.execute("UPDATE users SET trades = trades + 1 WHERE tg_id = ?", (garant_id,))
     conn.execute("UPDATE trade_rooms SET status = 'closed' WHERE thread_id = ?", (thread_id,))
@@ -1168,19 +1181,18 @@ async def close_trade_room(message: Message):
     conn.commit()
     conn.close()
     
-    # Оповещаем участников
     for p in participants:
         uid = p['user_id']
         if uid == garant_id:
-            msg_text = "✅ Безопасная комната закрыта! Вам начислена +1 сделка в профиль."
+            msg_text = "✅ Безопасная комната закрыта! Вам начислена +1 сделка."
         else:
-            msg_text = f"✅ Сделка через Гаранта завершена!\n\n⭐️ Пожалуйста, оставьте отзыв Гаранту через кнопку «⭐ Оставить отзыв» в боте!"
+            msg_text = f"✅ Сделка через Гаранта завершена!\n\n⭐️ Оставьте отзыв Гаранту через кнопку «⭐ Оставить отзыв»!"
         try: await bot.send_message(uid, msg_text)
         except: pass
 
     await check_achievements(garant_id)
 
-    await message.reply("🔒 <b>Сделка завершена. Сделка начислена Гаранту.</b>\nТема будет удалена через 5 секунд.")
+    await message.reply("🔒 <b>Сделка завершена.</b> Тема удалится через 5 секунд.")
     await asyncio.sleep(5)
     try:
         await bot.delete_forum_topic(chat_id=message.chat.id, message_thread_id=thread_id)
@@ -1208,9 +1220,6 @@ async def room_whitelist_protection(message: Message):
             except: pass
     conn.close()
 
-# ==========================================
-# ЖАЛОБЫ И ПРОВЕРКА
-# ==========================================
 @router.message(F.text == "🚨 Подать жалобу", IsPrivate())
 async def report_user_start(message: Message, state: FSMContext):
     await state.clear()
@@ -1232,8 +1241,7 @@ async def report_user_target(message: Message, state: FSMContext):
     else: user = conn.execute("SELECT tg_id FROM users WHERE username = ? COLLATE NOCASE", (target,)).fetchone()
     conn.close()
     
-    if not user:
-        return await message.answer("❌ Пользователь не найден.")
+    if not user: return await message.answer("❌ Пользователь не найден.")
         
     await state.update_data(target=message.text, target_id=user['tg_id'])
     await message.answer("Отправьте доказательства (текст, ссылки на чеки/скрины):", reply_markup=get_cancel_reply_kb())
@@ -1329,9 +1337,66 @@ async def send_check_result(message: Message, target: str, state: FSMContext = N
     else:
         await message.reply(text)
 
-# ==========================================
-# РАСШИРЕННАЯ АДМИН-ПАНЕЛЬ
-# ==========================================
+@router.inline_query()
+async def inline_check_handler(inline_query: InlineQuery):
+    query = inline_query.query.strip().replace("@", "")
+    if not query: return
+        
+    conn = get_db()
+    if query.isdigit():
+        user = conn.execute("SELECT * FROM users WHERE tg_id = ? OR roblox_id = ?", (int(query), query)).fetchone()
+    else:
+        user = conn.execute("SELECT * FROM users WHERE username = ? COLLATE NOCASE OR roblox_username = ? COLLATE NOCASE", (query, query)).fetchone()
+    conn.close()
+
+    results = []
+    if user:
+        u = dict(user)
+        risk_score = calculate_risk_score(u['tg_id'], False, u['suspected_boost'])
+        risk_status = "🟢 Низкий" if risk_score < 30 else "🟡 Средний" if risk_score < 70 else "🔴 Высокий"
+
+        status_str = "Обычный пользователь"
+        if u['status'] == 'garant': status_str = "⚖️ Официальный Гарант"
+        elif u['status'] == 'scammer': status_str = "☠️ В ЧЕРНОМ СПИСКЕ (СКАМЕР)"
+
+        text = (
+            f"🛡 <b>ДОСЬЕ ГАД: @{u['username']}</b>\n"
+            f"🔖 Telegram ID: <code>{u['tg_id']}</code>\n"
+            f"🎮 Roblox: <code>{u['roblox_username']}</code> (ID: {u['roblox_id']})\n"
+            f"🏆 Титул: {get_user_title(u['trades'])}\n"
+            f"🤝 Сделок: {u['trades']}\n"
+            f"⭐️ Рейтинг: {format_rating(u['rating_sum'], u['reviews_count'])}\n"
+            f"⚠️ Риск: {risk_status} ({risk_score}%)\n"
+            f"⚖️ Статус: {status_str}\n\n"
+            f"💬 Чат сделок: {OFFICIAL_CHAT}"
+        )
+        bot_info = await bot.get_me()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Проверить в боте", url=f"https://t.me/{bot_info.username}?start=check_{u['tg_id']}")]
+        ])
+
+        article = InlineQueryResultArticle(
+            id=str(u['tg_id']),
+            title=f"@{u['username']} | Сделок: {u['trades']} | Риск: {risk_score}%",
+            description=f"Roblox: {u['roblox_username']} | Статус: {u['status']}",
+            input_message_content=InputTextMessageContent(message_text=text, parse_mode=ParseMode.HTML),
+            reply_markup=kb
+        )
+        results.append(article)
+    else:
+        article = InlineQueryResultArticle(
+            id="not_found",
+            title="❓ Пользователь не найден",
+            description="Будьте осторожны при сделках с неизвестными участниками!",
+            input_message_content=InputTextMessageContent(
+                message_text=f"❓ Пользователь <b>{query}</b> не найден в базе данных ГАД.\n⚠️ Будьте предельно осторожны!",
+                parse_mode=ParseMode.HTML
+            )
+        )
+        results.append(article)
+
+    await inline_query.answer(results, cache_time=5, is_personal=True)
+
 @router.message(F.text == "👑 Админ Панель", IsStaff())
 async def admin_panel_start(message: Message):
     conn = get_db()
@@ -1640,13 +1705,10 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
     log_audit(message.from_user.id, f"Broadcasted to {success} users")
     await state.clear()
 
-# ==========================================
-# ТОЧКА ВХОДА И ЗАПУСК БОТА
-# ==========================================
 async def main():
     dp.include_router(router)
     print("========================================")
-    print(" ГАД (Global Antiscam Database) ЗАПУЩЕН!")
+    print(" ГАД (Global Antiscam Database) 2.0 ЗАПУЩЕН!")
     print("========================================")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
