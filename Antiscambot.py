@@ -1,3 +1,12 @@
+import sys
+import subprocess
+
+# Автоустановка недостающих библиотек при старте
+for package in ["Pillow", "aiohttp", "aiogram"]:
+    try:
+        __import__(package if package != "Pillow" else "PIL")
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 import asyncio
 import sqlite3
 import os
